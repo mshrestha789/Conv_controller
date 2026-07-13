@@ -25,7 +25,7 @@ RELAY_PIN = 27
 # Change depending on your relay module
 # If relay turns ON when GPIO is HIGH, use True.
 # If relay turns ON when GPIO is LOW, use False.
-RELAY_ACTIVE_HIGH = True
+RELAY_ACTIVE_HIGH = False
 
 # Change depending on your proximity sensor interface
 # If sensor output is HIGH when stem is detected, use True.
