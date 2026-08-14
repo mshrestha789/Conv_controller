@@ -23,7 +23,6 @@ IMAGE_DIR = Path.home() / "stem_conveyor" / "images"
 
 PROXIMITY_PIN = 17
 FORWARD_RELAY_PIN = 22
-
 REVERSE_RELAY_PIN = 27
 
 
@@ -68,10 +67,10 @@ DIRECTION_CHANGE_DEAD_TIME_MS = 800
 SENSOR_TO_STOP_DELAY_SEC = 1.7
 
 # Wait after stopping before taking the photo.
-BELT_SETTLE_DELAY_SEC = 0.4
+BELT_SETTLE_DELAY_SEC = 0.2
 
 # Short pause after a successful photo before restarting the belt.
-POST_CAPTURE_DELAY_SEC = 0.2
+POST_CAPTURE_DELAY_SEC = 0.1
 
 AUTO_CAPTURE_FORWARD = True
 AUTO_CAPTURE_REVERSE = False
@@ -92,12 +91,12 @@ CAMERA_TYPE = "picamera2"
 CAMERA_CAPTURE_TIMEOUT_SEC = 15.0
 CAMERA_KILL_GRACE_MS = 1000
 
-# Warm-up before still capture.
-CAMERA_WARMUP_SEC = 0.8
+# Camera is initialized once when the application starts and remains ready.
+# There is no per-photo camera warm-up delay.
 
-# Optional still size. None lets Picamera2 choose its default still mode.
-# Example: PICAMERA_STILL_SIZE = (4624, 3472)
-PICAMERA_STILL_SIZE = None
+# Use a practical still resolution instead of the 64 MP maximum/default.
+# This is about 16 MP and is much faster for repeated conveyor imaging.
+PICAMERA_STILL_SIZE = (4624, 3472)
 
 USB_CAMERA_INDEX = 0
 USB_CAMERA_WARMUP_SEC = 0.2

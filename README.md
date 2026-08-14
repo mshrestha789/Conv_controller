@@ -43,8 +43,8 @@ second closely following stem.
 
 ```python
 SENSOR_TO_STOP_DELAY_SEC = 1.7
-BELT_SETTLE_DELAY_SEC = 0.4
-POST_CAPTURE_DELAY_SEC = 0.2
+BELT_SETTLE_DELAY_SEC = 0.2
+POST_CAPTURE_DELAY_SEC = 0.1
 
 CAMERA_TYPE = "picamera2"
 CAMERA_CAPTURE_TIMEOUT_SEC = 15.0
@@ -264,3 +264,10 @@ Keep motor/high-power output disconnected first.
    remains OFF.
 7. Only after those checks, test with the real conveyor under appropriate
    physical safety controls.
+
+
+## Fast Persistent Camera Worker
+
+The CSI camera is initialized once when the application starts and remains running in an isolated camera worker process. Each photo request is sent to that existing worker, avoiding the several-second Picamera2/libcamera startup cost before every image.
+
+If a capture hangs, the GUI timeout kills the camera worker, keeps the conveyor OFF, and locks camera use until the application/Pi is restarted. This preserves the fail-closed behavior while making normal captures much faster.

@@ -1,128 +1,169 @@
-"""Isolated camera capture worker.
+"""Persistent isolated camera worker.
 
-One worker process is launched per photo. A stuck libcamera/Picamera2 call can
-therefore be timed out without blocking the Qt GUI or STOP button.
+The camera is initialized once and kept running for the life of this worker.
+The GUI sends one JSON command per line on stdin. The worker replies with one
+JSON event per line on stdout.
+
+Keeping Picamera2 initialized avoids the several-second startup cost before
+every photo, while process isolation still lets the GUI kill this worker if a
+camera/libcamera call hangs.
 """
 
+import json
 import sys
-import time
 from pathlib import Path
 
-from config import (
-    CAMERA_TYPE,
-    CAMERA_WARMUP_SEC,
-    PICAMERA_STILL_SIZE,
-    USB_CAMERA_INDEX,
-    USB_CAMERA_WARMUP_SEC,
-)
+from config import CAMERA_TYPE, PICAMERA_STILL_SIZE, USB_CAMERA_INDEX
 
 
-def capture_picamera(save_path: Path) -> int:
-    picam2 = None
-
-    try:
-        from picamera2 import Picamera2
-
-        if not Picamera2.global_camera_info():
-            print("No CSI camera detected.", file=sys.stderr)
-            return 2
-
-        picam2 = Picamera2()
-
-        if PICAMERA_STILL_SIZE is None:
-            camera_config = picam2.create_still_configuration()
-        else:
-            camera_config = picam2.create_still_configuration(
-                main={"size": tuple(PICAMERA_STILL_SIZE)}
-            )
-
-        picam2.configure(camera_config)
-        picam2.start()
-
-        time.sleep(CAMERA_WARMUP_SEC)
-        picam2.capture_file(str(save_path))
-
-        if not save_path.exists() or save_path.stat().st_size == 0:
-            print(
-                "Camera returned without creating a valid image.",
-                file=sys.stderr,
-            )
-            return 3
-
-        return 0
-
-    except Exception as error:
-        print(f"Picamera2 capture failed: {error}", file=sys.stderr)
-        return 4
-
-    finally:
-        if picam2 is not None:
-            try:
-                picam2.stop()
-            except Exception:
-                pass
-
-            try:
-                picam2.close()
-            except Exception:
-                pass
+def send_event(**payload):
+    print(json.dumps(payload), flush=True)
 
 
-def capture_usb(save_path: Path) -> int:
+def init_picamera():
+    from picamera2 import Picamera2
+
+    if not Picamera2.global_camera_info():
+        raise RuntimeError("No CSI camera detected.")
+
+    picam2 = Picamera2()
+
+    if PICAMERA_STILL_SIZE is None:
+        camera_config = picam2.create_still_configuration()
+    else:
+        camera_config = picam2.create_still_configuration(
+            main={"size": tuple(PICAMERA_STILL_SIZE)}
+        )
+
+    picam2.configure(camera_config)
+    picam2.start()
+    return picam2
+
+
+def init_usb_camera():
+    import cv2
+
+    camera = cv2.VideoCapture(USB_CAMERA_INDEX)
+    if not camera.isOpened():
+        camera.release()
+        raise RuntimeError("USB camera could not be opened.")
+    return camera
+
+
+def capture_picamera(camera, save_path: Path):
+    camera.capture_file(str(save_path))
+
+
+def capture_usb(camera, save_path: Path):
+    import cv2
+
+    success, frame = camera.read()
+    if not success:
+        raise RuntimeError("USB camera did not return an image.")
+    if not cv2.imwrite(str(save_path), frame):
+        raise RuntimeError("OpenCV could not save the image.")
+
+
+def close_camera(camera):
+    if camera is None:
+        return
+
+    if CAMERA_TYPE == "picamera2":
+        try:
+            camera.stop()
+        except Exception:
+            pass
+        try:
+            camera.close()
+        except Exception:
+            pass
+    elif CAMERA_TYPE == "usb":
+        try:
+            camera.release()
+        except Exception:
+            pass
+
+
+def main():
     camera = None
 
     try:
-        import cv2
+        if CAMERA_TYPE == "picamera2":
+            camera = init_picamera()
+        elif CAMERA_TYPE == "usb":
+            camera = init_usb_camera()
+        else:
+            raise RuntimeError(f"Unsupported CAMERA_TYPE: {CAMERA_TYPE}")
 
-        camera = cv2.VideoCapture(USB_CAMERA_INDEX)
+        send_event(event="ready")
 
-        if not camera.isOpened():
-            print("USB camera could not be opened.", file=sys.stderr)
-            return 5
+        for raw_line in sys.stdin:
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
 
-        time.sleep(USB_CAMERA_WARMUP_SEC)
-        success, frame = camera.read()
+            try:
+                command = json.loads(raw_line)
+            except json.JSONDecodeError as error:
+                send_event(event="error", message=f"Invalid command: {error}")
+                continue
 
-        if not success:
-            print("USB camera did not return an image.", file=sys.stderr)
-            return 6
+            action = command.get("cmd")
 
-        if not cv2.imwrite(str(save_path), frame):
-            print("OpenCV could not save the image.", file=sys.stderr)
-            return 7
+            if action == "shutdown":
+                send_event(event="shutdown")
+                return 0
 
-        return 0
+            if action != "capture":
+                send_event(event="error", message=f"Unknown command: {action}")
+                continue
+
+            save_path = Path(command.get("path", "")).expanduser()
+            if not str(save_path):
+                send_event(event="capture", success=False, path="", message="Missing output path.")
+                continue
+
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                save_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            try:
+                if CAMERA_TYPE == "picamera2":
+                    capture_picamera(camera, save_path)
+                else:
+                    capture_usb(camera, save_path)
+
+                if not save_path.exists() or save_path.stat().st_size == 0:
+                    raise RuntimeError("Camera returned without creating a valid image.")
+
+                send_event(
+                    event="capture",
+                    success=True,
+                    path=str(save_path),
+                    message="",
+                )
+
+            except Exception as error:
+                try:
+                    save_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+                send_event(
+                    event="capture",
+                    success=False,
+                    path=str(save_path),
+                    message=f"Camera capture failed: {error}",
+                )
 
     except Exception as error:
-        print(f"USB camera capture failed: {error}", file=sys.stderr)
-        return 8
+        send_event(event="fatal", message=str(error))
+        return 2
 
     finally:
-        if camera is not None:
-            camera.release()
-
-
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("Usage: camera_worker.py OUTPUT_PATH", file=sys.stderr)
-        return 64
-
-    save_path = Path(sys.argv[1]).expanduser()
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-
-    try:
-        save_path.unlink(missing_ok=True)
-    except OSError:
-        pass
-
-    if CAMERA_TYPE == "picamera2":
-        return capture_picamera(save_path)
-
-    if CAMERA_TYPE == "usb":
-        return capture_usb(save_path)
-
-    print(f"Unsupported CAMERA_TYPE: {CAMERA_TYPE}", file=sys.stderr)
-    return 65
+        close_camera(camera)
 
 
 if __name__ == "__main__":

@@ -71,6 +71,9 @@ class StemConveyorGUI(QWidget):
         self.camera.capture_completed.connect(
             self._on_camera_capture_completed
         )
+        self.camera.ready_changed.connect(
+            self._on_camera_ready_changed
+        )
         self.storage = StorageManager()
 
         # ====================================================
@@ -570,6 +573,12 @@ class StemConveyorGUI(QWidget):
     # ========================================================
 
     def start_system(self):
+        if not self.camera.ready:
+            self._say(
+                "Camera is not ready yet. Wait for initialization or check the CSI connection."
+            )
+            return
+
         if self.capture_cycle_in_progress:
             self._say("Please wait until the current photo cycle is finished.")
             return
@@ -734,6 +743,30 @@ class StemConveyorGUI(QWidget):
             self.btn_direction.setText("↔  SWITCH TO REVERSE")
         else:
             self.btn_direction.setText("↔  SWITCH TO FORWARD")
+
+    # ========================================================
+    # CAMERA STATE
+    # ========================================================
+
+    def _on_camera_ready_changed(self, ready, message):
+        if ready:
+            if not self.system_running and not self.capture_cycle_in_progress:
+                self._say("Camera ready. Press START BELT when the conveyor area is clear.")
+        else:
+            # Fail closed if the camera worker becomes unavailable while the
+            # system is operating. Camera availability is required for the
+            # automatic imaging cycle.
+            if self.system_running or self.conveyor_running:
+                self.hardware.conveyor_stop()
+                self.system_running = False
+                self.conveyor_running = False
+
+            if message:
+                self._say(f"Camera unavailable. Belt stopped. {message}")
+            else:
+                self._say("Camera unavailable. Belt stopped.")
+
+        self.update_status_display()
 
     # ========================================================
     # SENSOR + AUTOMATIC CAPTURE
@@ -1265,8 +1298,12 @@ class StemConveyorGUI(QWidget):
             self._set_status_color(self.usb_value, "#718096")
 
         # Avoid nonessential actions during an automatic cycle.
-        self.btn_start.setEnabled(not self.capture_cycle_in_progress)
-        self.btn_manual_capture.setEnabled(not self.capture_cycle_in_progress)
+        self.btn_start.setEnabled(
+            self.camera.ready and not self.capture_cycle_in_progress
+        )
+        self.btn_manual_capture.setEnabled(
+            self.camera.ready and not self.capture_cycle_in_progress
+        )
 
         self._update_direction_button()
 
