@@ -91,6 +91,10 @@ CAMERA_TYPE = "picamera2"
 CAMERA_CAPTURE_TIMEOUT_SEC = 15.0
 CAMERA_KILL_GRACE_MS = 1000
 
+# When RESET SYSTEM restarts the isolated camera worker, give libcamera a
+# short time to release the CSI device before initializing it again.
+CAMERA_RESET_RESTART_DELAY_MS = 750
+
 # Camera is initialized once when the application starts and remains ready.
 # There is no per-photo camera warm-up delay.
 

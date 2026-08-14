@@ -74,6 +74,9 @@ class StemConveyorGUI(QWidget):
         self.camera.ready_changed.connect(
             self._on_camera_ready_changed
         )
+        self.camera.reset_completed.connect(
+            self._on_camera_reset_completed
+        )
         self.storage = StorageManager()
 
         # ====================================================
@@ -86,6 +89,7 @@ class StemConveyorGUI(QWidget):
         self.selected_direction = DEFAULT_DIRECTION
         self.direction_change_in_progress = False
         self.pending_direction = None
+        self.reset_in_progress = False
 
         # Rising-edge detection so one stem does not repeatedly
         # trigger while it remains in front of the sensor.
@@ -297,6 +301,12 @@ class StemConveyorGUI(QWidget):
         self.btn_stop = QPushButton("■  STOP BELT")
         self.btn_stop.setObjectName("stopButton")
 
+        self.btn_reset = QPushButton("↻  RESET SYSTEM")
+        self.btn_reset.setObjectName("resetButton")
+        self.btn_reset.setToolTip(
+            "Stops the conveyor, clears the current cycle, and restarts the camera."
+        )
+
         self.btn_direction = QPushButton("↔  CHANGE DIRECTION")
         self.btn_direction.setObjectName("directionButton")
 
@@ -305,12 +315,14 @@ class StemConveyorGUI(QWidget):
 
         self.btn_start.clicked.connect(self.start_system)
         self.btn_stop.clicked.connect(self.stop_system)
+        self.btn_reset.clicked.connect(self.reset_system)
         self.btn_direction.clicked.connect(self.toggle_direction)
         self.btn_manual_capture.clicked.connect(self.manual_capture)
 
         for button in (
             self.btn_start,
             self.btn_stop,
+            self.btn_reset,
             self.btn_direction,
             self.btn_manual_capture,
         ):
@@ -526,6 +538,15 @@ class StemConveyorGUI(QWidget):
                 background-color: #bd3838;
             }
 
+            QPushButton#resetButton {
+                background-color: #d9822b;
+                color: white;
+            }
+
+            QPushButton#resetButton:hover {
+                background-color: #bd6f20;
+            }
+
             QPushButton#directionButton {
                 background-color: #7b61d1;
                 color: white;
@@ -573,6 +594,10 @@ class StemConveyorGUI(QWidget):
     # ========================================================
 
     def start_system(self):
+        if self.reset_in_progress:
+            self._say("System reset is still in progress. Please wait.")
+            return
+
         if not self.camera.ready:
             self._say(
                 "Camera is not ready yet. Wait for initialization or check the CSI connection."
@@ -632,11 +657,86 @@ class StemConveyorGUI(QWidget):
         self._say("Belt stopped.")
         self.update_status_display()
 
+    def reset_system(self):
+        """Return the application to a safe known state.
+
+        RESET SYSTEM always stops the conveyor first, cancels software timing,
+        clears the current capture cycle, and restarts only the isolated camera
+        worker. It never restarts the conveyor automatically.
+        """
+        if self.reset_in_progress:
+            self._say("System reset is already in progress.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Reset System?",
+            "Reset the system?\n\n"
+            "The conveyor will stop immediately, the current imaging cycle "
+            "will be cleared, and the camera will restart.\n\n"
+            "The conveyor will NOT restart automatically.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        # SAFETY FIRST: remove the conveyor run command before doing any
+        # camera/process recovery work.
+        try:
+            self.hardware.conveyor_stop()
+        except Exception:
+            pass
+
+        self.system_running = False
+        self.conveyor_running = False
+
+        # Cancel direction change and all conveyor/capture timing.
+        self.direction_timer.stop()
+        self.direction_change_in_progress = False
+        self.pending_direction = None
+
+        self.travel_timer.stop()
+        self.settle_timer.stop()
+        self.restart_timer.stop()
+
+        # Clear the imaging state without calling camera.cancel_capture();
+        # camera.reset() itself owns termination/recreation of the worker.
+        self.capture_cycle_in_progress = False
+        self.capture_stage = self.STAGE_IDLE
+        self.capture_source = "auto"
+        self.restart_after_capture = False
+        self.pending_capture_path = None
+
+        # Do not treat an object already on the sensor as a new edge after
+        # recovery. START BELT will sample this again as well.
+        self.sensor_was_active = self.hardware.stem_detected()
+
+        self.reset_in_progress = True
+        self._say(
+            "RESETTING SYSTEM... Belt is OFF. Restarting the camera."
+        )
+        self.update_status_display()
+
+        started = self.camera.reset()
+
+        if not started:
+            self.reset_in_progress = False
+            self._say(
+                "Reset could not be started. Belt remains stopped."
+            )
+            self.update_status_display()
+
     # ========================================================
     # DIRECTION
     # ========================================================
 
     def toggle_direction(self):
+        if self.reset_in_progress:
+            self._say("System reset is in progress. Please wait.")
+            return
+
         if self.capture_cycle_in_progress:
             self._say("Please wait until the current photo cycle is finished.")
             return
@@ -719,6 +819,11 @@ class StemConveyorGUI(QWidget):
         self.update_status_display()
 
     def _update_direction_button(self):
+        if self.reset_in_progress:
+            self.btn_direction.setText("↔  WAIT FOR RESET")
+            self.btn_direction.setEnabled(False)
+            return
+
         if not self.hardware.reverse_configured:
             self.btn_direction.setText("↔  REVERSE NOT SET UP")
             self.btn_direction.setEnabled(False)
@@ -750,21 +855,65 @@ class StemConveyorGUI(QWidget):
 
     def _on_camera_ready_changed(self, ready, message):
         if ready:
-            if not self.system_running and not self.capture_cycle_in_progress:
-                self._say("Camera ready. Press START BELT when the conveyor area is clear.")
+            if (
+                not self.reset_in_progress
+                and not self.system_running
+                and not self.capture_cycle_in_progress
+            ):
+                self._say(
+                    "Camera ready. Press START BELT when the conveyor area is clear."
+                )
         else:
-            # Fail closed if the camera worker becomes unavailable while the
-            # system is operating. Camera availability is required for the
-            # automatic imaging cycle.
+            # Fail closed whenever camera availability is lost.
             if self.system_running or self.conveyor_running:
                 self.hardware.conveyor_stop()
                 self.system_running = False
                 self.conveyor_running = False
 
-            if message:
+            if self.reset_in_progress:
+                self._say(
+                    "RESETTING SYSTEM... Belt is OFF. Restarting the camera."
+                )
+            elif message:
                 self._say(f"Camera unavailable. Belt stopped. {message}")
             else:
                 self._say("Camera unavailable. Belt stopped.")
+
+        self.update_status_display()
+
+    def _on_camera_reset_completed(self, success, message):
+        # Conveyor remains OFF regardless of reset result.
+        try:
+            self.hardware.conveyor_stop()
+        except Exception:
+            pass
+
+        self.system_running = False
+        self.conveyor_running = False
+        self.reset_in_progress = False
+        self.capture_cycle_in_progress = False
+        self.capture_stage = self.STAGE_IDLE
+        self.restart_after_capture = False
+        self.pending_capture_path = None
+        self.sensor_was_active = self.hardware.stem_detected()
+
+        if success:
+            self._say(
+                "System reset complete. Camera ready. Belt is stopped. "
+                "Press START BELT when ready."
+            )
+        else:
+            self._say(
+                "RESET FAILED. Belt remains stopped. Check the camera connection "
+                "and try RESET SYSTEM again."
+            )
+
+            QMessageBox.warning(
+                self,
+                "Reset Failed - Belt Stopped",
+                "The camera could not be restarted. The conveyor remains OFF.\n\n"
+                f"{message}",
+            )
 
         self.update_status_display()
 
@@ -914,7 +1063,7 @@ class StemConveyorGUI(QWidget):
 
         self._say(
             "CAMERA ERROR. Belt remains stopped. "
-            "Check the camera before pressing START BELT."
+            "Check the camera, then press RESET SYSTEM."
         )
         self.update_status_display()
 
@@ -974,6 +1123,10 @@ class StemConveyorGUI(QWidget):
     # ========================================================
 
     def manual_capture(self):
+        if self.reset_in_progress:
+            self._say("System reset is in progress. Please wait.")
+            return
+
         if self.capture_cycle_in_progress:
             self._say("Please wait for the current photo cycle to finish.")
             return
@@ -1223,7 +1376,11 @@ class StemConveyorGUI(QWidget):
         # SYSTEM
         # ----------------------------------------------------
 
-        if self.direction_change_in_progress:
+        if self.reset_in_progress:
+            self.system_value.setText("RESETTING")
+            self._set_status_color(self.system_value, "#d9822b")
+
+        elif self.direction_change_in_progress:
             self.system_value.setText("CHANGING")
             self._set_status_color(self.system_value, "#7b61d1")
 
@@ -1299,11 +1456,18 @@ class StemConveyorGUI(QWidget):
 
         # Avoid nonessential actions during an automatic cycle.
         self.btn_start.setEnabled(
-            self.camera.ready and not self.capture_cycle_in_progress
+            self.camera.ready
+            and not self.capture_cycle_in_progress
+            and not self.reset_in_progress
+            and not self.direction_change_in_progress
         )
         self.btn_manual_capture.setEnabled(
-            self.camera.ready and not self.capture_cycle_in_progress
+            self.camera.ready
+            and not self.capture_cycle_in_progress
+            and not self.reset_in_progress
+            and not self.direction_change_in_progress
         )
+        self.btn_reset.setEnabled(not self.reset_in_progress)
 
         self._update_direction_button()
 

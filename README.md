@@ -271,3 +271,41 @@ Keep motor/high-power output disconnected first.
 The CSI camera is initialized once when the application starts and remains running in an isolated camera worker process. Each photo request is sent to that existing worker, avoiding the several-second Picamera2/libcamera startup cost before every image.
 
 If a capture hangs, the GUI timeout kills the camera worker, keeps the conveyor OFF, and locks camera use until the application/Pi is restarted. This preserves the fail-closed behavior while making normal captures much faster.
+
+
+## RESET SYSTEM
+
+The GUI includes a **RESET SYSTEM** button for recovery from camera or software
+faults without rebooting the Raspberry Pi.
+
+Reset behavior is deliberately fail-closed:
+
+```text
+RESET SYSTEM
+     ↓
+Conveyor OFF immediately
+     ↓
+Cancel travel / settle / restart timers
+     ↓
+Clear the current imaging cycle
+     ↓
+Kill the isolated camera worker if needed
+     ↓
+Wait briefly for CSI/libcamera resources to release
+     ↓
+Start a fresh camera worker
+     ↓
+Camera READY
+     ↓
+Belt remains STOPPED
+     ↓
+Operator must press START BELT
+```
+
+RESET SYSTEM does **not** delete saved images, reset USB storage, change the
+selected direction, reboot Linux, or automatically restart the conveyor.
+
+If the camera cable is disconnected or the camera cannot be initialized, reset
+fails safely and the conveyor remains OFF. Check the camera connection and try
+RESET SYSTEM again. Power down the Raspberry Pi before physically removing or
+reconnecting the CSI ribbon cable.
