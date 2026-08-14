@@ -7,37 +7,33 @@ from config import (
     SENSOR_PULL_UP,
     SENSOR_BOUNCE_TIME_SEC,
     DEFAULT_DIRECTION,
+    ALLOW_GPIO_SIMULATION,
 )
 
 
 class Hardware:
-    """
-    Raspberry Pi GPIO interface.
+    """Raspberry Pi GPIO interface.
 
-    This class only handles low-voltage GPIO control signals.
-    The Raspberry Pi must NOT drive the conveyor motor directly.
+    The Raspberry Pi only provides low-voltage control signals. The motor
+    must be switched by properly rated and interlocked motor-control hardware.
 
-    Forward/reverse outputs are intended to control properly
-    rated and interlocked motor-control hardware.
+    The forward relay is intentionally active-low in the current system.
+    Logical ``off()`` therefore drives the physical GPIO HIGH.
     """
 
     VALID_DIRECTIONS = ("forward", "reverse")
 
     def __init__(self):
         self.gpio_available = False
-
         self.forward_relay = None
         self.reverse_relay = None
         self.sensor = None
-
         self.direction = DEFAULT_DIRECTION
         self.running = False
 
+        # GPIO is initialized before camera/storage/UI work so the conveyor
+        # is commanded OFF as early as possible during application startup.
         self._initialize_gpio()
-
-    # ========================================================
-    # INITIALIZATION
-    # ========================================================
 
     def _initialize_gpio(self):
         try:
@@ -46,7 +42,7 @@ class Hardware:
             self.forward_relay = OutputDevice(
                 FORWARD_RELAY_PIN,
                 active_high=RELAY_ACTIVE_HIGH,
-                initial_value=False,
+                initial_value=False,  # logical OFF; HIGH for active-low relay
             )
 
             if REVERSE_RELAY_PIN is not None:
@@ -63,40 +59,45 @@ class Hardware:
             )
 
             self.gpio_available = True
-            print("GPIO initialized successfully.")
+            self._all_outputs_off()
+            self.running = False
+            print("GPIO initialized. Conveyor outputs forced OFF.")
 
         except Exception as error:
             self.gpio_available = False
-            print("GPIO unavailable. Running in simulation mode.")
-            print(error)
+            self.running = False
 
-    # ========================================================
-    # CAPABILITIES
-    # ========================================================
+            if ALLOW_GPIO_SIMULATION:
+                print("GPIO unavailable. Simulation mode is enabled.")
+            else:
+                print("GPIO unavailable. Conveyor start is LOCKED OUT.")
+
+            print(error)
 
     @property
     def reverse_configured(self):
         return REVERSE_RELAY_PIN is not None
 
-    # ========================================================
-    # CONVEYOR CONTROL
-    # ========================================================
-
     def _all_outputs_off(self):
-        if self.gpio_available:
-            if self.forward_relay is not None:
-                self.forward_relay.off()
+        if not self.gpio_available:
+            return
 
-            if self.reverse_relay is not None:
-                self.reverse_relay.off()
+        if self.forward_relay is not None:
+            self.forward_relay.off()
+
+        if self.reverse_relay is not None:
+            self.reverse_relay.off()
 
     def conveyor_start(self, direction=None):
-        """
-        Start the conveyor in the requested direction.
+        """Start the conveyor in the requested direction.
 
-        Returns True if the command is accepted.
-        Returns False if reverse is requested but not configured.
+        Returns False if GPIO control is unavailable or reverse is not set up.
         """
+        if not self.gpio_available and not ALLOW_GPIO_SIMULATION:
+            print("Conveyor start refused: GPIO control is unavailable.")
+            self.running = False
+            return False
+
         if direction is None:
             direction = self.direction
 
@@ -108,11 +109,14 @@ class Hardware:
             )
 
         if direction == "reverse" and not self.reverse_configured:
-            print("Reverse direction requested, but REVERSE_RELAY_PIN is not configured.")
+            print(
+                "Reverse requested, but REVERSE_RELAY_PIN is not configured."
+            )
+            self.running = False
             return False
 
-        # Software interlock: never intentionally leave both
-        # direction outputs active at the same time.
+        # Software interlock: de-energize all direction outputs before
+        # energizing the requested direction.
         self._all_outputs_off()
 
         if self.gpio_available:
@@ -123,35 +127,24 @@ class Hardware:
 
         self.direction = direction
         self.running = True
-
         print(f"Conveyor started: {direction.upper()}")
         return True
 
     def conveyor_stop(self):
+        # For the active-low relay, off() means physical GPIO HIGH.
         self._all_outputs_off()
         self.running = False
         print("Conveyor STOPPED")
-
-    # ========================================================
-    # SENSOR
-    # ========================================================
 
     def stem_detected(self):
         if not self.gpio_available or self.sensor is None:
             return False
 
         value = bool(self.sensor.value)
-
-        if SENSOR_ACTIVE_HIGH:
-            return value
-
-        return not value
-
-    # ========================================================
-    # CLEANUP
-    # ========================================================
+        return value if SENSOR_ACTIVE_HIGH else not value
 
     def cleanup(self):
+        # Always command OFF before releasing GPIO handles.
         self.conveyor_stop()
 
         for device in (

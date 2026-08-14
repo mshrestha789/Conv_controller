@@ -1,130 +1,281 @@
-import time
+import sys
 from pathlib import Path
 
+from PySide6.QtCore import QObject, QProcess, QTimer, Signal
+
 from config import (
-    CAMERA_TYPE,
-    USB_CAMERA_INDEX,
-    USB_CAMERA_WARMUP_SEC,
+    CAMERA_CAPTURE_TIMEOUT_SEC,
+    CAMERA_KILL_GRACE_MS,
 )
 
 
-class Camera:
-    """
-    Image-capture interface.
+class Camera(QObject):
+    """Non-blocking, timeout-protected camera interface.
 
-    Supported:
-        - USB camera through OpenCV
-        - Raspberry Pi CSI camera through Picamera2
+    Every capture runs in camera_worker.py. If the camera stack hangs, the
+    worker is killed and the GUI is allowed to fail closed with the belt OFF.
     """
 
-    def __init__(self):
-        self.picam2 = None
+    capture_completed = Signal(bool, str, str)
 
-        if CAMERA_TYPE == "picamera2":
-            self._initialize_picamera()
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
-    # ========================================================
-    # PICAMERA2
-    # ========================================================
+        self.process = None
+        self.save_path = None
+        self._cancelled = False
+        self._timed_out = False
+        self._completion_emitted = False
+        self._process_error_text = ""
+        self._faulted = False
+        self._orphaned_processes = []
 
-    def _initialize_picamera(self):
-        try:
-            from picamera2 import Picamera2
+        self.timeout_timer = QTimer(self)
+        self.timeout_timer.setSingleShot(True)
+        self.timeout_timer.timeout.connect(self._on_timeout)
 
-            self.picam2 = Picamera2()
-            config = self.picam2.create_still_configuration()
-            self.picam2.configure(config)
-            self.picam2.start()
+        self.kill_grace_timer = QTimer(self)
+        self.kill_grace_timer.setSingleShot(True)
+        self.kill_grace_timer.timeout.connect(self._finalize_stuck_timeout)
 
-            time.sleep(1.0)
-            print("Picamera2 initialized.")
+        self.worker_script = Path(__file__).with_name("camera_worker.py")
 
-        except Exception as error:
-            self.picam2 = None
-            print("Picamera2 initialization failed.")
-            print(error)
+    @property
+    def busy(self):
+        return self.process is not None
 
-    # ========================================================
-    # CAPTURE
-    # ========================================================
+    @property
+    def faulted(self):
+        return self._faulted
 
-    def capture(self, save_path: Path):
-        save_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
+    def capture_async(self, save_path: Path):
+        """Launch a capture and return immediately.
+
+        Completion is reported through:
+            capture_completed(success, path, message)
+        """
+        if self.busy or self._faulted:
+            return False
+
+        if not self.worker_script.exists():
+            self.capture_completed.emit(
+                False,
+                str(save_path),
+                "camera_worker.py is missing.",
+            )
+            return False
+
+        self.save_path = Path(save_path)
+        self.save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._cancelled = False
+        self._timed_out = False
+        self._completion_emitted = False
+        self._process_error_text = ""
+
+        process = QProcess(self)
+        self.process = process
+
+        process.setProgram(sys.executable)
+        process.setArguments([
+            str(self.worker_script),
+            str(self.save_path),
+        ])
+
+        process.finished.connect(self._on_finished)
+        process.errorOccurred.connect(self._on_process_error)
+        process.start()
+
+        self.timeout_timer.start(
+            int(CAMERA_CAPTURE_TIMEOUT_SEC * 1000)
         )
 
-        if CAMERA_TYPE == "picamera2":
-            if self.picam2 is not None:
-                return self._capture_picamera(save_path)
+        return True
 
-            print("Picamera2 unavailable. Trying USB camera fallback.")
+    def _on_process_error(self, process_error):
+        self._process_error_text = (
+            f"Camera worker process error: {process_error}"
+        )
 
-        return self._capture_usb(save_path)
+    def _on_timeout(self):
+        if self.process is None:
+            return
 
-    def _capture_picamera(self, save_path: Path):
+        self._timed_out = True
+        self._faulted = True
+
+        # Never wait in the GUI thread for a broken camera process.
+        self.process.kill()
+        self.kill_grace_timer.start(CAMERA_KILL_GRACE_MS)
+
+    def _on_finished(self, exit_code, exit_status):
+        self.timeout_timer.stop()
+        self.kill_grace_timer.stop()
+
+        process = self.process
+        save_path = self.save_path
+
+        stdout_text = ""
+        stderr_text = ""
+
+        if process is not None:
+            stdout_text = bytes(process.readAllStandardOutput()).decode(
+                errors="replace"
+            ).strip()
+            stderr_text = bytes(process.readAllStandardError()).decode(
+                errors="replace"
+            ).strip()
+            process.deleteLater()
+
+        self.process = None
+        self.save_path = None
+
+        if self._cancelled:
+            self._cancelled = False
+            self._timed_out = False
+            return
+
+        if save_path is None or self._completion_emitted:
+            return
+
+        if self._timed_out:
+            self._timed_out = False
+            self._remove_partial_file(save_path)
+            self._emit_once(
+                False,
+                save_path,
+                f"Camera capture timed out after "
+                f"{CAMERA_CAPTURE_TIMEOUT_SEC:.0f} seconds. "
+                "The camera interface is locked for this application run. "
+                "The belt will remain stopped; restart the application or "
+                "reboot the Pi after checking the camera connection.",
+            )
+            return
+
+        success = (
+            exit_code == 0
+            and save_path.exists()
+            and save_path.stat().st_size > 0
+        )
+
+        if success:
+            self._emit_once(True, save_path, stdout_text)
+            return
+
+        self._remove_partial_file(save_path)
+        message = stderr_text or self._process_error_text
+
+        if not message:
+            message = f"Camera worker exited with code {exit_code}."
+
+        self._emit_once(False, save_path, message)
+
+    def _finalize_stuck_timeout(self):
+        """Return control even if SIGKILL cannot immediately reap the worker.
+
+        A process stuck in a kernel driver can sometimes remain present after
+        kill() is requested. The GUI must still become usable and keep the belt
+        OFF, so the stuck child is detached and camera use is locked out.
+        """
+        if self.process is None or self._completion_emitted:
+            return
+
+        process = self.process
+        save_path = self.save_path
+
         try:
-            self.picam2.capture_file(str(save_path))
-            print(f"Image saved: {save_path}")
-            return True
-
-        except Exception as error:
-            print("Picamera2 capture failed.")
-            print(error)
-            return False
-
-    def _capture_usb(self, save_path: Path):
-        camera = None
+            process.finished.disconnect(self._on_finished)
+        except Exception:
+            pass
 
         try:
-            import cv2
+            process.errorOccurred.disconnect(self._on_process_error)
+        except Exception:
+            pass
 
-            camera = cv2.VideoCapture(USB_CAMERA_INDEX)
+        process.finished.connect(
+            lambda *_args, p=process: self._cleanup_orphan(p)
+        )
 
-            if not camera.isOpened():
-                print("USB camera could not be opened.")
-                return False
+        self._orphaned_processes.append(process)
+        self.process = None
+        self.save_path = None
 
-            time.sleep(USB_CAMERA_WARMUP_SEC)
-
-            success, frame = camera.read()
-
-            if not success:
-                print("USB camera did not return an image.")
-                return False
-
-            saved = cv2.imwrite(
-                str(save_path),
-                frame,
+        if save_path is not None:
+            self._remove_partial_file(save_path)
+            self._emit_once(
+                False,
+                save_path,
+                f"Camera capture timed out after "
+                f"{CAMERA_CAPTURE_TIMEOUT_SEC:.0f} seconds and the camera "
+                "worker did not exit promptly. The belt remains stopped. "
+                "Check the CSI connection and reboot the Pi before continuing.",
             )
 
-            if not saved:
-                print("OpenCV could not save the image.")
-                return False
+    def _cleanup_orphan(self, process):
+        try:
+            self._orphaned_processes.remove(process)
+        except ValueError:
+            pass
 
-            print(f"Image saved: {save_path}")
-            return True
+        process.deleteLater()
 
-        except Exception as error:
-            print("USB camera capture failed.")
-            print(error)
-            return False
+    def _emit_once(self, success, save_path, message):
+        if self._completion_emitted:
+            return
 
-        finally:
-            if camera is not None:
-                camera.release()
+        self._completion_emitted = True
+        self.capture_completed.emit(
+            bool(success),
+            str(save_path),
+            str(message or ""),
+        )
 
-    # ========================================================
-    # CLEANUP
-    # ========================================================
+    @staticmethod
+    def _remove_partial_file(save_path):
+        try:
+            Path(save_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def cancel_capture(self):
+        """Cancel a capture without blocking STOP/Exit."""
+        self.timeout_timer.stop()
+        self.kill_grace_timer.stop()
+
+        process = self.process
+        self.process = None
+        self.save_path = None
+
+        if process is None:
+            return
+
+        self._cancelled = True
+
+        try:
+            process.finished.disconnect(self._on_finished)
+        except Exception:
+            pass
+
+        try:
+            process.errorOccurred.disconnect(self._on_process_error)
+        except Exception:
+            pass
+
+        process.finished.connect(
+            lambda *_args, p=process: self._cleanup_orphan(p)
+        )
+
+        self._orphaned_processes.append(process)
+        process.kill()
 
     def close(self):
-        if self.picam2 is not None:
+        self.cancel_capture()
+
+        for process in list(self._orphaned_processes):
             try:
-                self.picam2.stop()
+                process.kill()
             except Exception:
                 pass
 
-            self.picam2 = None
-
-        print("Camera closed.")
+        print("Camera worker stopped.")

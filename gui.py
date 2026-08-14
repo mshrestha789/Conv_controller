@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
@@ -19,7 +20,9 @@ from config import (
     IMAGE_DIR,
     DEFAULT_DIRECTION,
     DIRECTION_CHANGE_DEAD_TIME_MS,
-    SENSOR_TO_CAMERA_DELAY_SEC,
+    SENSOR_TO_STOP_DELAY_SEC,
+    BELT_SETTLE_DELAY_SEC,
+    POST_CAPTURE_DELAY_SEC,
     AUTO_CAPTURE_FORWARD,
     AUTO_CAPTURE_REVERSE,
     SENSOR_POLL_MS,
@@ -37,12 +40,24 @@ class StemConveyorGUI(QWidget):
 
     Normal automatic sequence:
         1. Start conveyor.
-        2. Sensor detects a stem.
-        3. Conveyor keeps moving.
-        4. App waits SENSOR_TO_CAMERA_DELAY_SEC.
-        5. Camera captures one image.
-        6. Conveyor keeps moving for the next stem.
+        2. Sensor detects one stem.
+        3. Conveyor keeps moving for SENSOR_TO_STOP_DELAY_SEC.
+        4. Conveyor stops.
+        5. Wait BELT_SETTLE_DELAY_SEC.
+        6. Capture the image while the stem is stationary.
+        7. Wait POST_CAPTURE_DELAY_SEC.
+        8. Restart conveyor for the next stem.
+
+    The workflow assumes one stem at a time between the sensor
+    and camera. Closely spaced stems can invalidate the timing
+    because the conveyor stops during each imaging cycle.
     """
+
+    STAGE_IDLE = "idle"
+    STAGE_TRAVELING = "traveling"
+    STAGE_SETTLING = "settling"
+    STAGE_CAPTURING = "capturing"
+    STAGE_RESTARTING = "restarting"
 
     def __init__(self):
         super().__init__()
@@ -52,7 +67,10 @@ class StemConveyorGUI(QWidget):
         # ====================================================
 
         self.hardware = Hardware()
-        self.camera = Camera()
+        self.camera = Camera(self)
+        self.camera.capture_completed.connect(
+            self._on_camera_capture_completed
+        )
         self.storage = StorageManager()
 
         # ====================================================
@@ -64,13 +82,18 @@ class StemConveyorGUI(QWidget):
 
         self.selected_direction = DEFAULT_DIRECTION
         self.direction_change_in_progress = False
+        self.pending_direction = None
 
-        # Used for rising-edge detection so one physical stem
-        # does not schedule many photos while the sensor stays active.
+        # Rising-edge detection so one stem does not repeatedly
+        # trigger while it remains in front of the sensor.
         self.sensor_was_active = False
 
-        # Each detected stem gets its own cancellable timer.
-        self.pending_capture_timers = []
+        # One automatic/manual capture cycle at a time.
+        self.capture_cycle_in_progress = False
+        self.capture_stage = self.STAGE_IDLE
+        self.capture_source = "auto"
+        self.restart_after_capture = False
+        self.pending_capture_path = None
 
         # ====================================================
         # IMAGE STATE
@@ -97,24 +120,16 @@ class StemConveyorGUI(QWidget):
         # ====================================================
 
         self.sensor_timer = QTimer(self)
-        self.sensor_timer.timeout.connect(
-            self.check_sensor
-        )
-        self.sensor_timer.start(
-            SENSOR_POLL_MS
-        )
+        self.sensor_timer.timeout.connect(self.check_sensor)
+        self.sensor_timer.start(SENSOR_POLL_MS)
 
         # ====================================================
         # STATUS TIMER
         # ====================================================
 
         self.status_timer = QTimer(self)
-        self.status_timer.timeout.connect(
-            self.update_status_display
-        )
-        self.status_timer.start(
-            STATUS_UPDATE_MS
-        )
+        self.status_timer.timeout.connect(self.update_status_display)
+        self.status_timer.start(STATUS_UPDATE_MS)
 
         # ====================================================
         # DIRECTION-CHANGE TIMER
@@ -122,11 +137,26 @@ class StemConveyorGUI(QWidget):
 
         self.direction_timer = QTimer(self)
         self.direction_timer.setSingleShot(True)
-        self.direction_timer.timeout.connect(
-            self._finish_direction_change
-        )
+        self.direction_timer.timeout.connect(self._finish_direction_change)
 
-        self.pending_direction = None
+        # ====================================================
+        # AUTOMATIC CAPTURE TIMERS
+        # ====================================================
+
+        # Sensor detected -> stem travels toward camera.
+        self.travel_timer = QTimer(self)
+        self.travel_timer.setSingleShot(True)
+        self.travel_timer.timeout.connect(self.stop_belt_for_capture)
+
+        # Belt stopped -> wait for vibration/motion to settle.
+        self.settle_timer = QTimer(self)
+        self.settle_timer.setSingleShot(True)
+        self.settle_timer.timeout.connect(self.capture_after_settle)
+
+        # Photo saved -> short pause -> restart conveyor.
+        self.restart_timer = QTimer(self)
+        self.restart_timer.setSingleShot(True)
+        self.restart_timer.timeout.connect(self.restart_after_capture_cycle)
 
         self.update_status_display()
         self._update_direction_button()
@@ -149,7 +179,9 @@ class StemConveyorGUI(QWidget):
         header.setAlignment(Qt.AlignCenter)
 
         subtitle = QLabel(
-            "Put stems on the belt. The sensor spots them and the camera takes the photo automatically."
+            "Place one stem at a time on the belt. "
+            "The system positions it, stops the belt, takes a photo, "
+            "and starts again automatically."
         )
         subtitle.setObjectName("subtitle")
         subtitle.setAlignment(Qt.AlignCenter)
@@ -221,10 +253,7 @@ class StemConveyorGUI(QWidget):
         self.image_preview.setMinimumSize(620, 360)
 
         preview_layout.addWidget(preview_title)
-        preview_layout.addWidget(
-            self.image_preview,
-            stretch=1,
-        )
+        preview_layout.addWidget(self.image_preview, stretch=1)
 
         # Photo list
         list_panel = QFrame()
@@ -235,38 +264,22 @@ class StemConveyorGUI(QWidget):
         list_title = QLabel("Saved Photos")
         list_title.setObjectName("sectionTitle")
 
-        list_hint = QLabel(
-            "Tap a photo to view it."
-        )
+        list_hint = QLabel("Tap a photo to view it.")
         list_hint.setObjectName("smallHint")
 
         self.image_list = QListWidget()
         self.image_list.setObjectName("imageList")
         self.image_list.setMinimumWidth(300)
-        self.image_list.itemClicked.connect(
-            self.select_image_from_list
-        )
+        self.image_list.itemClicked.connect(self.select_image_from_list)
 
         list_layout.addWidget(list_title)
         list_layout.addWidget(list_hint)
-        list_layout.addWidget(
-            self.image_list,
-            stretch=1,
-        )
+        list_layout.addWidget(self.image_list, stretch=1)
 
-        middle.addWidget(
-            preview_panel,
-            stretch=3,
-        )
-        middle.addWidget(
-            list_panel,
-            stretch=1,
-        )
+        middle.addWidget(preview_panel, stretch=3)
+        middle.addWidget(list_panel, stretch=1)
 
-        root.addLayout(
-            middle,
-            stretch=1,
-        )
+        root.addLayout(middle, stretch=1)
 
         # ----------------------------------------------------
         # MAIN CONTROLS
@@ -275,46 +288,22 @@ class StemConveyorGUI(QWidget):
         control_row = QHBoxLayout()
         control_row.setSpacing(10)
 
-        self.btn_start = QPushButton(
-            "▶  START BELT"
-        )
-        self.btn_start.setObjectName(
-            "startButton"
-        )
+        self.btn_start = QPushButton("▶  START BELT")
+        self.btn_start.setObjectName("startButton")
 
-        self.btn_stop = QPushButton(
-            "■  STOP BELT"
-        )
-        self.btn_stop.setObjectName(
-            "stopButton"
-        )
+        self.btn_stop = QPushButton("■  STOP BELT")
+        self.btn_stop.setObjectName("stopButton")
 
-        self.btn_direction = QPushButton(
-            "↔  CHANGE DIRECTION"
-        )
-        self.btn_direction.setObjectName(
-            "directionButton"
-        )
+        self.btn_direction = QPushButton("↔  CHANGE DIRECTION")
+        self.btn_direction.setObjectName("directionButton")
 
-        self.btn_manual_capture = QPushButton(
-            "CAMERA  TAKE PHOTO"
-        )
-        self.btn_manual_capture.setObjectName(
-            "photoButton"
-        )
+        self.btn_manual_capture = QPushButton("CAMERA  TAKE PHOTO")
+        self.btn_manual_capture.setObjectName("photoButton")
 
-        self.btn_start.clicked.connect(
-            self.start_system
-        )
-        self.btn_stop.clicked.connect(
-            self.stop_system
-        )
-        self.btn_direction.clicked.connect(
-            self.toggle_direction
-        )
-        self.btn_manual_capture.clicked.connect(
-            self.manual_capture
-        )
+        self.btn_start.clicked.connect(self.start_system)
+        self.btn_stop.clicked.connect(self.stop_system)
+        self.btn_direction.clicked.connect(self.toggle_direction)
+        self.btn_manual_capture.clicked.connect(self.manual_capture)
 
         for button in (
             self.btn_start,
@@ -334,43 +323,19 @@ class StemConveyorGUI(QWidget):
         photo_row = QHBoxLayout()
         photo_row.setSpacing(8)
 
-        self.btn_prev = QPushButton(
-            "◀ Previous"
-        )
-        self.btn_next = QPushButton(
-            "Next ▶"
-        )
-        self.btn_copy_current = QPushButton(
-            "Save This to USB"
-        )
-        self.btn_copy_all = QPushButton(
-            "Save All to USB"
-        )
-        self.btn_delete = QPushButton(
-            "Delete Photo"
-        )
-        self.btn_exit = QPushButton(
-            "Exit"
-        )
+        self.btn_prev = QPushButton("◀ Previous")
+        self.btn_next = QPushButton("Next ▶")
+        self.btn_copy_current = QPushButton("Save This to USB")
+        self.btn_copy_all = QPushButton("Save All to USB")
+        self.btn_delete = QPushButton("Delete Photo")
+        self.btn_exit = QPushButton("Exit")
 
-        self.btn_prev.clicked.connect(
-            self.previous_image
-        )
-        self.btn_next.clicked.connect(
-            self.next_image
-        )
-        self.btn_copy_current.clicked.connect(
-            self.copy_current_to_usb
-        )
-        self.btn_copy_all.clicked.connect(
-            self.copy_all_to_usb
-        )
-        self.btn_delete.clicked.connect(
-            self.delete_current_image
-        )
-        self.btn_exit.clicked.connect(
-            self.close
-        )
+        self.btn_prev.clicked.connect(self.previous_image)
+        self.btn_next.clicked.connect(self.next_image)
+        self.btn_copy_current.clicked.connect(self.copy_current_to_usb)
+        self.btn_copy_all.clicked.connect(self.copy_all_to_usb)
+        self.btn_delete.clicked.connect(self.delete_current_image)
+        self.btn_exit.clicked.connect(self.close)
 
         for button in (
             self.btn_prev,
@@ -381,9 +346,7 @@ class StemConveyorGUI(QWidget):
             self.btn_exit,
         ):
             button.setMinimumHeight(46)
-            button.setObjectName(
-                "smallButton"
-            )
+            button.setObjectName("smallButton")
             photo_row.addWidget(button)
 
         root.addLayout(photo_row)
@@ -395,72 +358,40 @@ class StemConveyorGUI(QWidget):
         self.message_label = QLabel(
             "Ready! Press START BELT when everyone is clear of the conveyor."
         )
-        self.message_label.setObjectName(
-            "messageBanner"
-        )
-        self.message_label.setAlignment(
-            Qt.AlignCenter
-        )
+        self.message_label.setObjectName("messageBanner")
+        self.message_label.setAlignment(Qt.AlignCenter)
         self.message_label.setWordWrap(True)
 
-        root.addWidget(
-            self.message_label
-        )
+        root.addWidget(self.message_label)
 
         self.auto_mode_label = QLabel(
-            f"Auto photo: sensor detects a stem → waits {SENSOR_TO_CAMERA_DELAY_SEC:.1f} s → takes one photo."
+            f"Auto mode: detect stem → move {SENSOR_TO_STOP_DELAY_SEC:.1f} s "
+            f"→ stop belt → settle {BELT_SETTLE_DELAY_SEC:.1f} s "
+            "→ take photo → restart belt."
         )
-        self.auto_mode_label.setObjectName(
-            "smallHint"
-        )
-        self.auto_mode_label.setAlignment(
-            Qt.AlignCenter
-        )
+        self.auto_mode_label.setObjectName("smallHint")
+        self.auto_mode_label.setAlignment(Qt.AlignCenter)
 
-        root.addWidget(
-            self.auto_mode_label
-        )
+        root.addWidget(self.auto_mode_label)
 
-    def _make_status_card(
-        self,
-        layout,
-        title,
-        value,
-    ):
+    def _make_status_card(self, layout, title, value):
         card = QFrame()
         card.setObjectName("statusCard")
 
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(
-            8,
-            7,
-            8,
-            7,
-        )
+        card_layout.setContentsMargins(8, 7, 8, 7)
         card_layout.setSpacing(2)
 
         title_label = QLabel(title)
-        title_label.setObjectName(
-            "statusTitle"
-        )
-        title_label.setAlignment(
-            Qt.AlignCenter
-        )
+        title_label.setObjectName("statusTitle")
+        title_label.setAlignment(Qt.AlignCenter)
 
         value_label = QLabel(value)
-        value_label.setObjectName(
-            "statusValue"
-        )
-        value_label.setAlignment(
-            Qt.AlignCenter
-        )
+        value_label.setObjectName("statusValue")
+        value_label.setAlignment(Qt.AlignCenter)
 
-        card_layout.addWidget(
-            title_label
-        )
-        card_layout.addWidget(
-            value_label
-        )
+        card_layout.addWidget(title_label)
+        card_layout.addWidget(value_label)
 
         layout.addWidget(card)
 
@@ -639,47 +570,40 @@ class StemConveyorGUI(QWidget):
     # ========================================================
 
     def start_system(self):
+        if self.capture_cycle_in_progress:
+            self._say("Please wait until the current photo cycle is finished.")
+            return
+
         if self.direction_change_in_progress:
-            self._say(
-                "Direction is changing. Please wait."
-            )
+            self._say("Direction is changing. Please wait.")
             return
 
         if self.system_running and self.conveyor_running:
-            self._say(
-                "The belt is already running."
-            )
+            self._say("The belt is already running.")
             return
 
-        started = self.hardware.conveyor_start(
-            self.selected_direction
-        )
+        started = self.hardware.conveyor_start(self.selected_direction)
 
         if not started:
             QMessageBox.warning(
                 self,
-                "Reverse Not Set Up",
-                "Reverse control is not configured yet.\n\n"
-                "Set REVERSE_RELAY_PIN in config.py after confirming the actual wiring.",
+                "Conveyor Could Not Start",
+                "The conveyor start command was refused.\n\n"
+                "Check GPIO initialization and, for reverse operation, "
+                "confirm REVERSE_RELAY_PIN is configured.",
             )
             return
 
         self.system_running = True
         self.conveyor_running = True
 
-        # If a stem is already sitting on the sensor when START
-        # is pressed, wait for it to clear before accepting a
-        # new rising edge.
-        self.sensor_was_active = (
-            self.hardware.stem_detected()
-        )
-
-        direction_text = (
-            self.selected_direction.upper()
-        )
+        # If something is already on the sensor when START is pressed,
+        # wait for it to clear before accepting a new stem.
+        self.sensor_was_active = self.hardware.stem_detected()
 
         self._say(
-            f"Belt started {direction_text}. Automatic photo mode is ready."
+            f"Belt started {self.selected_direction.upper()}. "
+            "Ready for one stem at a time."
         )
 
         self.update_status_display()
@@ -689,17 +613,14 @@ class StemConveyorGUI(QWidget):
         self.direction_change_in_progress = False
         self.pending_direction = None
 
-        self.cancel_pending_captures()
+        self.cancel_capture_cycle()
 
         self.system_running = False
         self.conveyor_running = False
 
         self.hardware.conveyor_stop()
 
-        self._say(
-            "Belt stopped. Pending automatic photos were canceled."
-        )
-
+        self._say("Belt stopped.")
         self.update_status_display()
 
     # ========================================================
@@ -707,19 +628,21 @@ class StemConveyorGUI(QWidget):
     # ========================================================
 
     def toggle_direction(self):
+        if self.capture_cycle_in_progress:
+            self._say("Please wait until the current photo cycle is finished.")
+            return
+
         if not self.hardware.reverse_configured:
             QMessageBox.information(
                 self,
                 "Reverse Control Not Configured",
                 "The direction button is ready in the software, but the reverse GPIO pin is not set.\n\n"
-                "After your reverse-control hardware is wired, set REVERSE_RELAY_PIN in config.py.",
+                "After the reverse-control hardware is wired, set REVERSE_RELAY_PIN in config.py.",
             )
             return
 
         if self.direction_change_in_progress:
-            self._say(
-                "Direction is already changing."
-            )
+            self._say("Direction is already changing.")
             return
 
         target = (
@@ -727,10 +650,6 @@ class StemConveyorGUI(QWidget):
             if self.selected_direction == "forward"
             else "forward"
         )
-
-        # Any photo scheduled from the old travel direction is
-        # no longer geometrically valid after a reversal.
-        self.cancel_pending_captures()
 
         if not self.system_running:
             self.selected_direction = target
@@ -751,17 +670,10 @@ class StemConveyorGUI(QWidget):
         self.conveyor_running = False
         self.hardware.conveyor_stop()
 
-        self._say(
-            f"Changing direction to {target.upper()}..."
-        )
+        self._say(f"Changing direction to {target.upper()}...")
 
-        self.btn_direction.setEnabled(
-            False
-        )
-
-        self.direction_timer.start(
-            DIRECTION_CHANGE_DEAD_TIME_MS
-        )
+        self.btn_direction.setEnabled(False)
+        self.direction_timer.start(DIRECTION_CHANGE_DEAD_TIME_MS)
 
         self.update_status_display()
 
@@ -778,12 +690,11 @@ class StemConveyorGUI(QWidget):
         self.selected_direction = target
 
         if self.system_running:
-            started = self.hardware.conveyor_start(
-                target
-            )
+            started = self.hardware.conveyor_start(target)
 
             if started:
                 self.conveyor_running = True
+                self.sensor_was_active = self.hardware.stem_detected()
 
                 self._say(
                     f"Direction changed. Belt is now moving {target.upper()}."
@@ -793,47 +704,36 @@ class StemConveyorGUI(QWidget):
                 self.conveyor_running = False
                 self.system_running = False
 
-                self._say(
-                    "Could not start in the new direction."
-                )
+                self._say("Could not start in the new direction.")
 
         self._update_direction_button()
         self.update_status_display()
 
     def _update_direction_button(self):
         if not self.hardware.reverse_configured:
-            self.btn_direction.setText(
-                "↔  REVERSE NOT SET UP"
-            )
-            self.btn_direction.setEnabled(
-                False
-            )
+            self.btn_direction.setText("↔  REVERSE NOT SET UP")
+            self.btn_direction.setEnabled(False)
             self.btn_direction.setToolTip(
                 "Set REVERSE_RELAY_PIN in config.py after confirming the wiring."
             )
             return
 
         if self.direction_change_in_progress:
-            self.btn_direction.setText(
-                "↔  CHANGING..."
-            )
-            self.btn_direction.setEnabled(
-                False
-            )
+            self.btn_direction.setText("↔  CHANGING...")
+            self.btn_direction.setEnabled(False)
             return
 
-        self.btn_direction.setEnabled(
-            True
-        )
+        if self.capture_cycle_in_progress:
+            self.btn_direction.setText("↔  WAIT FOR PHOTO")
+            self.btn_direction.setEnabled(False)
+            return
+
+        self.btn_direction.setEnabled(True)
 
         if self.selected_direction == "forward":
-            self.btn_direction.setText(
-                "↔  SWITCH TO REVERSE"
-            )
+            self.btn_direction.setText("↔  SWITCH TO REVERSE")
         else:
-            self.btn_direction.setText(
-                "↔  SWITCH TO FORWARD"
-            )
+            self.btn_direction.setText("↔  SWITCH TO FORWARD")
 
     # ========================================================
     # SENSOR + AUTOMATIC CAPTURE
@@ -842,16 +742,17 @@ class StemConveyorGUI(QWidget):
     def check_sensor(self):
         detected = self.hardware.stem_detected()
 
-        # Rising edge: CLEAR -> DETECTED
+        # Rising edge: CLEAR -> STEM DETECTED
         if detected and not self.sensor_was_active:
             self.sensor_was_active = True
 
             if (
                 self.system_running
                 and self.conveyor_running
+                and not self.capture_cycle_in_progress
                 and self._auto_capture_allowed()
             ):
-                self.schedule_automatic_capture()
+                self.start_automatic_capture_cycle()
 
             elif (
                 self.system_running
@@ -859,10 +760,11 @@ class StemConveyorGUI(QWidget):
                 and not self._auto_capture_allowed()
             ):
                 self._say(
-                    f"Stem detected, but auto photo is OFF in {self.selected_direction.upper()} mode."
+                    f"Stem detected, but auto photo is OFF in "
+                    f"{self.selected_direction.upper()} mode."
                 )
 
-        # Rearm only after the stem leaves the sensor.
+        # Rearm after the object leaves the sensor.
         elif not detected:
             self.sensor_was_active = False
 
@@ -872,185 +774,239 @@ class StemConveyorGUI(QWidget):
 
         return AUTO_CAPTURE_REVERSE
 
-    def schedule_automatic_capture(self):
-        timer = QTimer(self)
-        timer.setSingleShot(True)
+    def start_automatic_capture_cycle(self):
+        if self.capture_cycle_in_progress:
+            return
 
-        trigger_direction = self.selected_direction
-
-        timer.timeout.connect(
-            lambda t=timer, d=trigger_direction:
-            self._run_scheduled_capture(t, d)
-        )
-
-        self.pending_capture_timers.append(
-            timer
-        )
-
-        timer.start(
-            int(
-                SENSOR_TO_CAMERA_DELAY_SEC
-                * 1000
-            )
-        )
-
-        queue_count = len(
-            self.pending_capture_timers
-        )
+        self.capture_cycle_in_progress = True
+        self.capture_stage = self.STAGE_TRAVELING
+        self.capture_source = "auto"
+        self.restart_after_capture = True
 
         self._say(
-            f"Stem spotted! Photo in {SENSOR_TO_CAMERA_DELAY_SEC:.1f} seconds. "
-            f"Queued photos: {queue_count}."
+            f"Stem detected! Moving to the camera. "
+            f"Belt will stop in {SENSOR_TO_STOP_DELAY_SEC:.1f} seconds."
         )
 
-    def _run_scheduled_capture(
-        self,
-        timer,
-        trigger_direction,
-    ):
-        if timer in self.pending_capture_timers:
-            self.pending_capture_timers.remove(
-                timer
+        self.travel_timer.start(
+            int(SENSOR_TO_STOP_DELAY_SEC * 1000)
+        )
+
+        self.update_status_display()
+
+    def stop_belt_for_capture(self):
+        if not self.capture_cycle_in_progress:
+            return
+
+        if not self.system_running and self.capture_source == "auto":
+            self.cancel_capture_cycle()
+            return
+
+        self.hardware.conveyor_stop()
+        self.conveyor_running = False
+        self.capture_stage = self.STAGE_SETTLING
+
+        self._say(
+            "Belt stopped. Waiting for the stem to become completely still..."
+        )
+
+        self.settle_timer.start(
+            int(BELT_SETTLE_DELAY_SEC * 1000)
+        )
+
+        self.update_status_display()
+
+    def capture_after_settle(self):
+        if not self.capture_cycle_in_progress:
+            return
+
+        if self.capture_source == "auto" and not self.system_running:
+            self.cancel_capture_cycle()
+            return
+
+        self.capture_stage = self.STAGE_CAPTURING
+        self._say("Taking photo...")
+        self.update_status_display()
+
+        started = self.start_capture_image(source=self.capture_source)
+
+        if not started and self.capture_cycle_in_progress:
+            self._handle_camera_failure(
+                "The camera worker could not be started."
             )
 
-        timer.deleteLater()
-
-        # If STOP or direction change happened after detection,
-        # do not take a now-invalid automatic image.
-        if not self.system_running:
-            return
-
-        if not self.conveyor_running:
-            return
-
+    def _on_camera_capture_completed(self, success, path_text, message):
+        # Ignore a late result from a capture that the user already stopped.
         if (
-            self.selected_direction
-            != trigger_direction
+            not self.capture_cycle_in_progress
+            or self.capture_stage != self.STAGE_CAPTURING
         ):
             return
 
-        if not self._auto_capture_allowed():
+        save_path = Path(path_text)
+        self.pending_capture_path = None
+
+        if not success:
+            self._handle_camera_failure(message)
             return
 
-        self.capture_image(
-            source="auto"
+        self.session_photo_count += 1
+        self.refresh_image_list(preferred_path=save_path)
+
+        if self.restart_after_capture and self.system_running:
+            self.capture_stage = self.STAGE_RESTARTING
+            self._say("Photo saved! Restarting the belt...")
+
+            self.restart_timer.start(
+                int(POST_CAPTURE_DELAY_SEC * 1000)
+            )
+        else:
+            self.capture_cycle_in_progress = False
+            self.capture_stage = self.STAGE_IDLE
+            self.restart_after_capture = False
+            self._say("Photo saved. Belt remains stopped.")
+
+        self.update_status_display()
+
+    def _handle_camera_failure(self, message):
+        # Fail closed: never restart the conveyor after a camera error.
+        self.hardware.conveyor_stop()
+        self.conveyor_running = False
+        self.system_running = False
+
+        self.capture_cycle_in_progress = False
+        self.capture_stage = self.STAGE_IDLE
+        self.restart_after_capture = False
+        self.pending_capture_path = None
+
+        self._say(
+            "CAMERA ERROR. Belt remains stopped. "
+            "Check the camera before pressing START BELT."
+        )
+        self.update_status_display()
+
+        QMessageBox.warning(
+            self,
+            "Camera Error - Belt Stopped",
+            "The photo could not be completed. The conveyor has been kept OFF.\n\n"
+            f"{message}",
         )
 
-    def cancel_pending_captures(self):
-        for timer in self.pending_capture_timers:
-            try:
-                timer.stop()
-                timer.deleteLater()
-            except Exception:
-                pass
+    def restart_after_capture_cycle(self):
+        if not self.capture_cycle_in_progress:
+            return
 
-        self.pending_capture_timers.clear()
+        if not self.system_running:
+            self.cancel_capture_cycle()
+            return
+
+        started = self.hardware.conveyor_start(self.selected_direction)
+
+        if not started:
+            self.conveyor_running = False
+            self.capture_cycle_in_progress = False
+            self.capture_stage = self.STAGE_IDLE
+            self.restart_after_capture = False
+
+            self._say("Could not restart the conveyor.")
+            self.update_status_display()
+            return
+
+        self.conveyor_running = True
+        self.capture_cycle_in_progress = False
+        self.capture_stage = self.STAGE_IDLE
+        self.restart_after_capture = False
+
+        # Do not create a false rising edge immediately after restart.
+        self.sensor_was_active = self.hardware.stem_detected()
+
+        self._say("Photo saved. Belt restarted. Ready for the next stem!")
+        self.update_status_display()
+
+    def cancel_capture_cycle(self):
+        self.travel_timer.stop()
+        self.settle_timer.stop()
+        self.restart_timer.stop()
+
+        self.camera.cancel_capture()
+
+        self.capture_cycle_in_progress = False
+        self.capture_stage = self.STAGE_IDLE
+        self.capture_source = "auto"
+        self.restart_after_capture = False
+        self.pending_capture_path = None
 
     # ========================================================
     # MANUAL PHOTO
     # ========================================================
 
     def manual_capture(self):
-        self._say(
-            "Taking a photo now..."
+        if self.capture_cycle_in_progress:
+            self._say("Please wait for the current photo cycle to finish.")
+            return
+
+        if self.direction_change_in_progress:
+            self._say("Please wait until the direction change is finished.")
+            return
+
+        self.capture_cycle_in_progress = True
+        self.capture_source = "manual"
+
+        # If the belt was moving, restart it after the photo.
+        self.restart_after_capture = (
+            self.system_running and self.conveyor_running
         )
 
-        self.capture_image(
-            source="manual"
+        if self.conveyor_running:
+            self.hardware.conveyor_stop()
+            self.conveyor_running = False
+
+        self.capture_stage = self.STAGE_SETTLING
+        self._say("Belt stopped. Preparing manual photo...")
+
+        self.settle_timer.start(
+            int(BELT_SETTLE_DELAY_SEC * 1000)
         )
+
+        self.update_status_display()
 
     # ========================================================
     # IMAGE CAPTURE
     # ========================================================
 
-    def capture_image(
-        self,
-        source="auto",
-    ):
-        # Milliseconds are included so two quick captures do not
-        # overwrite each other.
-        timestamp = (
-            datetime.now()
-            .strftime(
-                "%Y%m%d_%H%M%S_%f"
-            )[:-3]
-        )
+    def start_capture_image(self, source="auto"):
+        # Milliseconds are included so quick captures do not overwrite.
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        save_path = IMAGE_DIR / f"stem_{source}_{timestamp}.jpg"
 
-        save_path = (
-            IMAGE_DIR
-            / f"stem_{source}_{timestamp}.jpg"
-        )
+        self.pending_capture_path = save_path
 
-        success = self.camera.capture(
-            save_path
-        )
+        started = self.camera.capture_async(save_path)
 
-        if not success:
-            self._say(
-                "Camera problem: photo was not saved."
-            )
+        if not started:
+            self.pending_capture_path = None
 
-            QMessageBox.warning(
-                self,
-                "Camera Problem",
-                "The camera could not take a photo.",
-            )
-            return False
-
-        self.session_photo_count += 1
-
-        self.refresh_image_list(
-            preferred_path=save_path
-        )
-
-        if source == "auto":
-            self._say(
-                f"Photo captured automatically: {save_path.name}"
-            )
-        else:
-            self._say(
-                f"Manual photo saved: {save_path.name}"
-            )
-
-        return True
+        return started
 
     # ========================================================
     # IMAGE LIST
     # ========================================================
 
-    def refresh_image_list(
-        self,
-        preferred_path=None,
-    ):
+    def refresh_image_list(self, preferred_path=None):
         old_path = None
 
         if (
             self.image_files
-            and 0 <= self.current_index < len(
-                self.image_files
-            )
+            and 0 <= self.current_index < len(self.image_files)
         ):
-            old_path = self.image_files[
-                self.current_index
-            ]
+            old_path = self.image_files[self.current_index]
 
-        self.image_files = (
-            self.storage.get_images()
-        )
-
+        self.image_files = self.storage.get_images()
         self.image_list.clear()
 
-        for number, image_path in enumerate(
-            self.image_files,
-            start=1,
-        ):
-            item = QListWidgetItem(
-                f"{number}. {image_path.name}"
-            )
-
-            self.image_list.addItem(
-                item
-            )
+        for number, image_path in enumerate(self.image_files, start=1):
+            item = QListWidgetItem(f"{number}. {image_path.name}")
+            self.image_list.addItem(item)
 
         if not self.image_files:
             self.current_index = -1
@@ -1061,32 +1017,16 @@ class StemConveyorGUI(QWidget):
             self.update_status_display()
             return
 
-        target_path = (
-            preferred_path
-            or old_path
-        )
+        target_path = preferred_path or old_path
 
-        if (
-            target_path is not None
-            and target_path in self.image_files
-        ):
-            self.current_index = (
-                self.image_files.index(
-                    target_path
-                )
-            )
+        if target_path is not None and target_path in self.image_files:
+            self.current_index = self.image_files.index(target_path)
 
         elif self.current_index < 0:
-            self.current_index = (
-                len(self.image_files) - 1
-            )
+            self.current_index = len(self.image_files) - 1
 
-        elif self.current_index >= len(
-            self.image_files
-        ):
-            self.current_index = (
-                len(self.image_files) - 1
-            )
+        elif self.current_index >= len(self.image_files):
+            self.current_index = len(self.image_files) - 1
 
         self.show_current_image()
         self.update_status_display()
@@ -1095,31 +1035,18 @@ class StemConveyorGUI(QWidget):
         if (
             not self.image_files
             or self.current_index < 0
-            or self.current_index >= len(
-                self.image_files
-            )
+            or self.current_index >= len(self.image_files)
         ):
             self.image_preview.clear()
-            self.image_preview.setText(
-                "No photo selected."
-            )
+            self.image_preview.setText("No photo selected.")
             return
 
-        image_path = (
-            self.image_files[
-                self.current_index
-            ]
-        )
-
-        pixmap = QPixmap(
-            str(image_path)
-        )
+        image_path = self.image_files[self.current_index]
+        pixmap = QPixmap(str(image_path))
 
         if pixmap.isNull():
             self.image_preview.clear()
-            self.image_preview.setText(
-                "This photo could not be opened."
-            )
+            self.image_preview.setText("This photo could not be opened.")
             return
 
         scaled = pixmap.scaled(
@@ -1128,25 +1055,13 @@ class StemConveyorGUI(QWidget):
             Qt.SmoothTransformation,
         )
 
-        self.image_preview.setPixmap(
-            scaled
-        )
+        self.image_preview.setPixmap(scaled)
+        self.image_list.setCurrentRow(self.current_index)
 
-        self.image_list.setCurrentRow(
-            self.current_index
-        )
+    def select_image_from_list(self, item):
+        row = self.image_list.row(item)
 
-    def select_image_from_list(
-        self,
-        item,
-    ):
-        row = self.image_list.row(
-            item
-        )
-
-        if 0 <= row < len(
-            self.image_files
-        ):
+        if 0 <= row < len(self.image_files):
             self.current_index = row
             self.show_current_image()
 
@@ -1154,11 +1069,7 @@ class StemConveyorGUI(QWidget):
         if not self.image_files:
             return
 
-        self.current_index = max(
-            0,
-            self.current_index - 1,
-        )
-
+        self.current_index = max(0, self.current_index - 1)
         self.show_current_image()
 
     def next_image(self):
@@ -1169,14 +1080,10 @@ class StemConveyorGUI(QWidget):
             len(self.image_files) - 1,
             self.current_index + 1,
         )
-
         self.show_current_image()
 
     def delete_current_image(self):
-        if (
-            not self.image_files
-            or self.current_index < 0
-        ):
+        if not self.image_files or self.current_index < 0:
             QMessageBox.information(
                 self,
                 "No Photo Selected",
@@ -1184,26 +1091,19 @@ class StemConveyorGUI(QWidget):
             )
             return
 
-        image_path = (
-            self.image_files[
-                self.current_index
-            ]
-        )
+        image_path = self.image_files[self.current_index]
 
         reply = QMessageBox.question(
             self,
             "Delete Photo?",
             f"Delete this photo?\n\n{image_path.name}",
-            QMessageBox.Yes
-            | QMessageBox.No,
+            QMessageBox.Yes | QMessageBox.No,
         )
 
         if reply != QMessageBox.Yes:
             return
 
-        if not self.storage.delete_image(
-            image_path
-        ):
+        if not self.storage.delete_image(image_path):
             QMessageBox.warning(
                 self,
                 "Delete Problem",
@@ -1213,20 +1113,14 @@ class StemConveyorGUI(QWidget):
 
         self.current_index = -1
         self.refresh_image_list()
-
-        self._say(
-            "Photo deleted."
-        )
+        self._say("Photo deleted.")
 
     # ========================================================
     # USB
     # ========================================================
 
     def copy_current_to_usb(self):
-        if (
-            not self.image_files
-            or self.current_index < 0
-        ):
+        if not self.image_files or self.current_index < 0:
             QMessageBox.information(
                 self,
                 "No Photo Selected",
@@ -1234,18 +1128,10 @@ class StemConveyorGUI(QWidget):
             )
             return
 
-        image_path = (
-            self.image_files[
-                self.current_index
-            ]
-        )
+        image_path = self.image_files[self.current_index]
 
         try:
-            destination = (
-                self.storage.copy_image_to_usb(
-                    image_path
-                )
-            )
+            destination = self.storage.copy_image_to_usb(image_path)
 
         except Exception as error:
             QMessageBox.warning(
@@ -1263,9 +1149,7 @@ class StemConveyorGUI(QWidget):
             )
             return
 
-        self._say(
-            f"Saved {image_path.name} to USB."
-        )
+        self._say(f"Saved {image_path.name} to USB.")
 
     def copy_all_to_usb(self):
         if not self.image_files:
@@ -1277,11 +1161,7 @@ class StemConveyorGUI(QWidget):
             return
 
         try:
-            copied = (
-                self.storage.copy_all_images_to_usb(
-                    self.image_files
-                )
-            )
+            copied = self.storage.copy_all_images_to_usb(self.image_files)
 
         except Exception as error:
             QMessageBox.warning(
@@ -1299,179 +1179,132 @@ class StemConveyorGUI(QWidget):
             )
             return
 
-        self._say(
-            f"Saved {copied} photos to USB."
-        )
+        self._say(f"Saved {copied} photos to USB.")
 
     # ========================================================
     # STATUS
     # ========================================================
 
     def update_status_display(self):
-        # System
+        # ----------------------------------------------------
+        # SYSTEM
+        # ----------------------------------------------------
+
         if self.direction_change_in_progress:
-            self.system_value.setText(
-                "CHANGING"
-            )
-            self._set_status_color(
-                self.system_value,
-                "#7b61d1",
-            )
+            self.system_value.setText("CHANGING")
+            self._set_status_color(self.system_value, "#7b61d1")
+
+        elif self.capture_cycle_in_progress:
+            stage_text = {
+                self.STAGE_TRAVELING: "POSITIONING",
+                self.STAGE_SETTLING: "SETTLING",
+                self.STAGE_CAPTURING: "TAKING PHOTO",
+                self.STAGE_RESTARTING: "RESTARTING",
+            }.get(self.capture_stage, "BUSY")
+
+            self.system_value.setText(stage_text)
+            self._set_status_color(self.system_value, "#c17b16")
 
         elif self.system_running:
-            self.system_value.setText(
-                "RUNNING"
-            )
-            self._set_status_color(
-                self.system_value,
-                "#1f8f62",
-            )
+            self.system_value.setText("RUNNING")
+            self._set_status_color(self.system_value, "#1f8f62")
 
         else:
-            self.system_value.setText(
-                "READY"
-            )
-            self._set_status_color(
-                self.system_value,
-                "#52637a",
-            )
+            self.system_value.setText("READY")
+            self._set_status_color(self.system_value, "#52637a")
 
-        # Belt
+        # ----------------------------------------------------
+        # BELT
+        # ----------------------------------------------------
+
         if self.direction_change_in_progress:
-            self.belt_value.setText(
-                "STOPPING"
-            )
-            self._set_status_color(
-                self.belt_value,
-                "#c17b16",
-            )
+            self.belt_value.setText("STOPPED")
+            self._set_status_color(self.belt_value, "#c17b16")
 
         elif self.conveyor_running:
-            self.belt_value.setText(
-                self.selected_direction.upper()
-            )
-
-            self._set_status_color(
-                self.belt_value,
-                "#1f8f62",
-            )
+            self.belt_value.setText(self.selected_direction.upper())
+            self._set_status_color(self.belt_value, "#1f8f62")
 
         else:
             self.belt_value.setText(
                 f"STOPPED • {self.selected_direction.upper()}"
             )
+            self._set_status_color(self.belt_value, "#c44949")
 
-            self._set_status_color(
-                self.belt_value,
-                "#c44949",
-            )
+        # ----------------------------------------------------
+        # SENSOR
+        # ----------------------------------------------------
 
-        # Sensor
-        detected = (
-            self.hardware.stem_detected()
-        )
+        detected = self.hardware.stem_detected()
 
         if detected:
-            self.sensor_value.setText(
-                "STEM SEEN"
-            )
-            self._set_status_color(
-                self.sensor_value,
-                "#c17b16",
-            )
+            self.sensor_value.setText("STEM SEEN")
+            self._set_status_color(self.sensor_value, "#c17b16")
         else:
-            self.sensor_value.setText(
-                "CLEAR"
-            )
-            self._set_status_color(
-                self.sensor_value,
-                "#1f8f62",
-            )
+            self.sensor_value.setText("CLEAR")
+            self._set_status_color(self.sensor_value, "#1f8f62")
 
-        # Photos
-        self.photos_value.setText(
-            str(
-                len(self.image_files)
-            )
-        )
+        # ----------------------------------------------------
+        # PHOTOS
+        # ----------------------------------------------------
 
-        self._set_status_color(
-            self.photos_value,
-            "#2457d6",
-        )
+        self.photos_value.setText(str(len(self.image_files)))
+        self._set_status_color(self.photos_value, "#2457d6")
 
+        # ----------------------------------------------------
         # USB
-        usb_found = (
-            self.storage.find_usb_mount()
-            is not None
-        )
+        # ----------------------------------------------------
+
+        usb_found = self.storage.find_usb_mount() is not None
 
         if usb_found:
-            self.usb_value.setText(
-                "READY"
-            )
-            self._set_status_color(
-                self.usb_value,
-                "#1f8f62",
-            )
+            self.usb_value.setText("READY")
+            self._set_status_color(self.usb_value, "#1f8f62")
         else:
-            self.usb_value.setText(
-                "NOT FOUND"
-            )
-            self._set_status_color(
-                self.usb_value,
-                "#718096",
-            )
+            self.usb_value.setText("NOT FOUND")
+            self._set_status_color(self.usb_value, "#718096")
+
+        # Avoid nonessential actions during an automatic cycle.
+        self.btn_start.setEnabled(not self.capture_cycle_in_progress)
+        self.btn_manual_capture.setEnabled(not self.capture_cycle_in_progress)
 
         self._update_direction_button()
 
     @staticmethod
-    def _set_status_color(
-        label,
-        color,
-    ):
-        label.setStyleSheet(
-            f"color: {color};"
-        )
+    def _set_status_color(label, color):
+        label.setStyleSheet(f"color: {color};")
 
-    def _say(
-        self,
-        message,
-    ):
-        self.message_label.setText(
-            message
-        )
+    def _say(self, message):
+        self.message_label.setText(message)
+
+    def emergency_stop(self):
+        """Best-effort software emergency stop used on errors and exit."""
+        try:
+            self.direction_timer.stop()
+            self.cancel_capture_cycle()
+        except Exception:
+            pass
+
+        self.system_running = False
+        self.conveyor_running = False
+
+        try:
+            self.hardware.conveyor_stop()
+        except Exception:
+            pass
 
     # ========================================================
     # RESIZE / CLOSE
     # ========================================================
 
-    def resizeEvent(
-        self,
-        event,
-    ):
-        if hasattr(
-            self,
-            "image_preview",
-        ):
+    def resizeEvent(self, event):
+        if hasattr(self, "image_preview"):
             self.show_current_image()
 
-        super().resizeEvent(
-            event
-        )
+        super().resizeEvent(event)
 
-    def closeEvent(
-        self,
-        event,
-    ):
-        self.direction_timer.stop()
-
-        self.cancel_pending_captures()
-
-        self.system_running = False
-        self.conveyor_running = False
-
-        self.hardware.cleanup()
+    def closeEvent(self, event):
+        self.emergency_stop()
         self.camera.close()
-
+        self.hardware.cleanup()
         event.accept()

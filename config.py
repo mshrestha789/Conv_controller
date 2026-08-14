@@ -22,27 +22,18 @@ IMAGE_DIR = Path.home() / "stem_conveyor" / "images"
 # ============================================================
 
 PROXIMITY_PIN = 17
+FORWARD_RELAY_PIN = 22
 
-# Your original project used GPIO 27 for the conveyor relay.
-FORWARD_RELAY_PIN = 27
-
-# IMPORTANT:
-# Set this to the BCM GPIO pin connected to the REVERSE control
-# input of your properly interlocked motor-control hardware.
-#
-# Example only:
-# REVERSE_RELAY_PIN = 22
-#
-# Leave as None until the actual wiring is confirmed.
-REVERSE_RELAY_PIN = None
+REVERSE_RELAY_PIN = 27
 
 
 # ============================================================
 # RELAY CONFIGURATION
 # ============================================================
 
-# True  -> relay/input turns ON when GPIO is HIGH
-# False -> relay/input turns ON when GPIO is LOW
+# Keep the current ACTIVE-LOW relay behavior:
+#   GPIO LOW  -> logical ON  -> relay energized
+#   GPIO HIGH -> logical OFF -> relay de-energized
 RELAY_ACTIVE_HIGH = False
 
 
@@ -53,11 +44,7 @@ RELAY_ACTIVE_HIGH = False
 # True  -> sensor HIGH means stem detected
 # False -> sensor LOW means stem detected
 SENSOR_ACTIVE_HIGH = True
-
-# Use True only if your sensor interface needs the Pi's pull-up.
 SENSOR_PULL_UP = False
-
-# Helps reject rapid electrical chatter/noise.
 SENSOR_BOUNCE_TIME_SEC = 0.05
 
 
@@ -67,9 +54,8 @@ SENSOR_BOUNCE_TIME_SEC = 0.05
 
 DEFAULT_DIRECTION = "forward"
 
-# Motor must be stopped before changing direction.
-# This is a software delay only. Proper electrical/mechanical
-# interlocking is still required in the motor-control hardware.
+# Software dead time for direction changes. Proper electrical or
+# mechanical interlocking is still required in the motor-control circuit.
 DIRECTION_CHANGE_DEAD_TIME_MS = 800
 
 
@@ -77,14 +63,16 @@ DIRECTION_CHANGE_DEAD_TIME_MS = 800
 # AUTOMATIC IMAGE CAPTURE
 # ============================================================
 
-# Time for the stem to travel from the proximity sensor
-# to the camera position while the conveyor keeps moving.
-#
-# Tune this experimentally.
-SENSOR_TO_CAMERA_DELAY_SEC = 2.0
+# The measured sensor-to-camera travel time is about 2 seconds.
+# Stop slightly earlier because the conveyor has some coast/inertia.
+SENSOR_TO_STOP_DELAY_SEC = 1.7
 
-# Normally the sensor-to-camera geometry is calibrated for
-# forward travel. Reverse auto-capture is disabled by default.
+# Wait after stopping before taking the photo.
+BELT_SETTLE_DELAY_SEC = 0.4
+
+# Short pause after a successful photo before restarting the belt.
+POST_CAPTURE_DELAY_SEC = 0.2
+
 AUTO_CAPTURE_FORWARD = True
 AUTO_CAPTURE_REVERSE = False
 
@@ -96,11 +84,33 @@ STATUS_UPDATE_MS = 500
 # CAMERA
 # ============================================================
 
-# "usb" or "picamera2"
-CAMERA_TYPE = "usb"
+# Current Arducam CSI setup.
+CAMERA_TYPE = "picamera2"
+
+# The camera is isolated in camera_worker.py. If libcamera/Picamera2
+# stops responding, the GUI times it out without freezing.
+CAMERA_CAPTURE_TIMEOUT_SEC = 15.0
+CAMERA_KILL_GRACE_MS = 1000
+
+# Warm-up before still capture.
+CAMERA_WARMUP_SEC = 0.8
+
+# Optional still size. None lets Picamera2 choose its default still mode.
+# Example: PICAMERA_STILL_SIZE = (4624, 3472)
+PICAMERA_STILL_SIZE = None
 
 USB_CAMERA_INDEX = 0
 USB_CAMERA_WARMUP_SEC = 0.2
+
+
+# ============================================================
+# APPLICATION WATCHDOG
+# ============================================================
+
+# Heartbeat is sent from a QTimer running in the MAIN Qt event loop.
+# It becomes active automatically when the application is launched by
+# a systemd service with WatchdogSec= configured.
+APP_WATCHDOG_HEARTBEAT_MS = 1000
 
 
 # ============================================================
@@ -115,3 +125,12 @@ USB_MOUNT_ROOTS = (
 )
 
 USB_IMAGE_FOLDER = "stem_images"
+
+
+# ============================================================
+# DEVELOPMENT / SAFETY
+# ============================================================
+
+# Keep False on the real conveyor. If GPIO initialization fails,
+# conveyor start is refused rather than simulated.
+ALLOW_GPIO_SIMULATION = False
