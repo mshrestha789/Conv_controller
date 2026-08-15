@@ -18,11 +18,12 @@ RestartSec=1s
 KillMode=control-group
 TimeoutStopSec=3s
 
-# Optional extra software layer for the ACTIVE-LOW forward relay.
-# On Raspberry Pi OS, pinctrl can force GPIO27 HIGH (= relay OFF).
-# Test these commands manually first on your Pi. If your user cannot run
-# pinctrl, comment these two lines until permissions are corrected.
+# Optional extra software layer for both ACTIVE-LOW direction relays.
+# Tested configuration: GPIO22=FORWARD and GPIO27=REVERSE.
+# HIGH = relay OFF. Test these commands manually before enabling the service.
+ExecStartPre=/usr/bin/pinctrl 22 op dh
 ExecStartPre=/usr/bin/pinctrl 27 op dh
+ExecStopPost=/usr/bin/pinctrl 22 op dh
 ExecStopPost=/usr/bin/pinctrl 27 op dh
 
 Environment=PYTHONUNBUFFERED=1

@@ -46,6 +46,12 @@ SENSOR_ACTIVE_HIGH = True
 SENSOR_PULL_UP = False
 SENSOR_BOUNCE_TIME_SEC = 0.05
 
+# If the sensor stays continuously ACTIVE while the automatic system is
+# operating, treat it as a fault. This catches a sensor/output stuck HIGH or
+# an object that never clears the sensor. It cannot prove that a sensor stuck
+# permanently CLEAR is healthy; see README.md for that hardware limitation.
+SENSOR_STUCK_ACTIVE_TIMEOUT_SEC = 5.0
+
 
 # ============================================================
 # CONVEYOR DIRECTION

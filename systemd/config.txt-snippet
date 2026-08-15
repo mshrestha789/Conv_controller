@@ -1,8 +1,10 @@
 # Add these lines to /boot/firmware/config.txt.
 # Keep your existing Arducam overlay lines as they are.
 
-# ACTIVE-LOW conveyor relay on BCM GPIO27:
+# ACTIVE-LOW conveyor direction relays:
+# BCM GPIO22 = FORWARD, BCM GPIO27 = REVERSE
 # HIGH = relay OFF.
+gpio=22=op,dh
 gpio=27=op,dh
 
 # Raspberry Pi hardware watchdog handoff to the OS.
