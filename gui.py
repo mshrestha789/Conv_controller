@@ -29,6 +29,7 @@ from config import (
     SENSOR_POLL_MS,
     STATUS_UPDATE_MS,
     SENSOR_STUCK_ACTIVE_TIMEOUT_SEC,
+    NO_DETECTION_TIMEOUT_SEC,
 )
 
 from hardware import Hardware
@@ -52,7 +53,9 @@ class StemConveyorGUI(QWidget):
 
     The workflow assumes one stem at a time between the sensor
     and camera. Closely spaced stems can invalidate the timing
-    because the conveyor stops during each imaging cycle.
+    because the conveyor stops during each imaging cycle. A separate
+    no-detection watchdog stops the belt if automatic operation runs
+    too long without seeing a new stem.
     """
 
     STAGE_IDLE = "idle"
@@ -103,7 +106,14 @@ class StemConveyorGUI(QWidget):
         # only after the physical sensor input is CLEAR.
         self.sensor_active_since = None
         self.sensor_fault = False
+        self.sensor_fault_kind = None
         self.sensor_fault_message = ""
+
+        # No-detection watchdog. While the belt is moving in a direction where
+        # automatic capture is enabled, this tracks how long the system has
+        # run without seeing a new stem. It is paused/reset whenever the belt
+        # is intentionally stopped or a stem is detected.
+        self.no_detection_since = None
 
         # One automatic/manual capture cycle at a time.
         self.capture_cycle_in_progress = False
@@ -392,7 +402,7 @@ class StemConveyorGUI(QWidget):
         self.auto_mode_label = QLabel(
             f"Auto mode: detect stem → move {SENSOR_TO_STOP_DELAY_SEC:.1f} s "
             f"→ stop belt → settle {BELT_SETTLE_DELAY_SEC:.1f} s "
-            "→ take photo → restart belt."
+            f"→ photo → restart. No detection for {NO_DETECTION_TIMEOUT_SEC:.0f} s → belt stops."
         )
         self.auto_mode_label.setObjectName("smallHint")
         self.auto_mode_label.setAlignment(Qt.AlignCenter)
@@ -609,10 +619,16 @@ class StemConveyorGUI(QWidget):
             return
 
         if self.sensor_fault:
-            self._say(
-                "SENSOR FAULT is latched. Check/clear the proximity sensor, "
-                "then press RESET SYSTEM."
-            )
+            if self.sensor_fault_kind == "no_detection":
+                self._say(
+                    "NO DETECTION fault is latched. Check the stem feed and "
+                    "proximity sensor, then press RESET SYSTEM."
+                )
+            else:
+                self._say(
+                    "SENSOR FAULT is latched. Check/clear the proximity sensor, "
+                    "then press RESET SYSTEM."
+                )
             return
 
         # Starting with an already-active sensor is ambiguous: it may be a
@@ -662,10 +678,12 @@ class StemConveyorGUI(QWidget):
         # detector and no active-duration timer.
         self.sensor_was_active = False
         self.sensor_active_since = None
+        self._arm_no_detection_watchdog()
 
         self._say(
             f"Belt started {self.selected_direction.upper()}. "
-            "Ready for one stem at a time."
+            f"Ready for one stem at a time. If no stem is detected for "
+            f"{NO_DETECTION_TIMEOUT_SEC:.0f} seconds, the belt will stop."
         )
 
         self.update_status_display()
@@ -680,6 +698,7 @@ class StemConveyorGUI(QWidget):
         self.system_running = False
         self.conveyor_running = False
         self.sensor_active_since = None
+        self.no_detection_since = None
 
         self.hardware.conveyor_stop()
 
@@ -691,8 +710,9 @@ class StemConveyorGUI(QWidget):
 
         RESET SYSTEM always stops the conveyor first, cancels software timing,
         clears the current capture cycle, and restarts only the isolated camera
-        worker. It never restarts the conveyor automatically. A latched sensor
-        fault clears only if the physical proximity input is CLEAR after reset.
+        worker. It never restarts the conveyor automatically. A stuck-ACTIVE
+        sensor fault clears only if the physical proximity input is CLEAR after
+        reset. A NO DETECTION fault also requires RESET before a new START.
         """
         if self.reset_in_progress:
             self._say("System reset is already in progress.")
@@ -704,7 +724,8 @@ class StemConveyorGUI(QWidget):
             "Reset the system?\n\n"
             "The conveyor will stop immediately, the current imaging cycle "
             "will be cleared, and the camera will restart.\n\n"
-            "A sensor fault will clear only if the proximity sensor is CLEAR.\n\n"
+            "A stuck-ACTIVE sensor fault clears only if the proximity sensor is CLEAR.\n"
+            "A NO DETECTION fault also requires RESET before another START.\n\n"
             "The conveyor will NOT restart automatically.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -743,6 +764,7 @@ class StemConveyorGUI(QWidget):
         # Stop the stuck-active timer while the system is intentionally reset.
         # The sensor fault latch is evaluated again after camera reset.
         self.sensor_active_since = None
+        self.no_detection_since = None
         self.sensor_was_active = self.hardware.stem_detected()
 
         self.reset_in_progress = True
@@ -809,6 +831,7 @@ class StemConveyorGUI(QWidget):
         self.pending_direction = target
 
         self.conveyor_running = False
+        self.no_detection_since = None
         self.hardware.conveyor_stop()
 
         self._say(f"Changing direction to {target.upper()}...")
@@ -836,6 +859,8 @@ class StemConveyorGUI(QWidget):
             if started:
                 self.conveyor_running = True
                 self.sensor_was_active = self.hardware.stem_detected()
+                self.sensor_active_since = None
+                self._arm_no_detection_watchdog()
 
                 self._say(
                     f"Direction changed. Belt is now moving {target.upper()}."
@@ -857,7 +882,10 @@ class StemConveyorGUI(QWidget):
             return
 
         if self.sensor_fault:
-            self.btn_direction.setText("↔  SENSOR FAULT")
+            if self.sensor_fault_kind == "no_detection":
+                self.btn_direction.setText("↔  CHECK SENSOR")
+            else:
+                self.btn_direction.setText("↔  SENSOR FAULT")
             self.btn_direction.setEnabled(False)
             return
 
@@ -906,6 +934,7 @@ class StemConveyorGUI(QWidget):
                 self.hardware.conveyor_stop()
                 self.system_running = False
                 self.conveyor_running = False
+                self.no_detection_since = None
 
             if self.reset_in_progress:
                 self._say(
@@ -936,17 +965,20 @@ class StemConveyorGUI(QWidget):
         detected = self.hardware.stem_detected()
         self.sensor_was_active = detected
         self.sensor_active_since = None
+        self.no_detection_since = None
 
         # A sensor fault is deliberately latched until RESET SYSTEM is
         # completed while the physical sensor input is CLEAR. This prevents
         # a stuck-active sensor from being "reset" back into motion.
         if detected:
             self.sensor_fault = True
+            self.sensor_fault_kind = "stuck_active"
             self.sensor_fault_message = (
                 "Proximity sensor is still ACTIVE after reset."
             )
         else:
             self.sensor_fault = False
+            self.sensor_fault_kind = None
             self.sensor_fault_message = ""
 
         if success and not self.sensor_fault:
@@ -1010,7 +1042,8 @@ class StemConveyorGUI(QWidget):
                 if active_for >= SENSOR_STUCK_ACTIVE_TIMEOUT_SEC:
                     self._trigger_sensor_fault(
                         f"Proximity sensor stayed ACTIVE for "
-                        f"{active_for:.1f} seconds."
+                        f"{active_for:.1f} seconds.",
+                        kind="stuck_active",
                     )
                     return
         else:
@@ -1027,6 +1060,10 @@ class StemConveyorGUI(QWidget):
         # ----------------------------------------------------
         if detected and not self.sensor_was_active:
             self.sensor_was_active = True
+
+            # A real sensor transition ends the current no-detection interval.
+            # A fresh interval begins only after the conveyor restarts.
+            self.no_detection_since = None
 
             if (
                 self.system_running
@@ -1050,13 +1087,59 @@ class StemConveyorGUI(QWidget):
         elif not detected:
             self.sensor_was_active = False
 
-    def _trigger_sensor_fault(self, message):
+        # ----------------------------------------------------
+        # NO-DETECTION WATCHDOG
+        # ----------------------------------------------------
+        # Monitor only while the belt is actually moving in a direction where
+        # automatic capture is enabled. Pausing during a photo or direction
+        # change avoids counting intentional stopped time.
+        monitor_no_detection = (
+            self.system_running
+            and self.conveyor_running
+            and not self.capture_cycle_in_progress
+            and not self.direction_change_in_progress
+            and not self.reset_in_progress
+            and self._auto_capture_allowed()
+        )
+
+        if monitor_no_detection and not detected:
+            if self.no_detection_since is None:
+                self.no_detection_since = time.monotonic()
+            else:
+                no_detection_for = time.monotonic() - self.no_detection_since
+                if no_detection_for >= NO_DETECTION_TIMEOUT_SEC:
+                    self._trigger_sensor_fault(
+                        f"No stem was detected while the belt ran for "
+                        f"{no_detection_for:.1f} seconds.",
+                        kind="no_detection",
+                    )
+                    return
+        elif not monitor_no_detection:
+            self.no_detection_since = None
+
+    def _arm_no_detection_watchdog(self):
+        """Start a fresh no-detection interval during automatic operation."""
+        if (
+            self.system_running
+            and self.conveyor_running
+            and self._auto_capture_allowed()
+            and not self.capture_cycle_in_progress
+            and not self.direction_change_in_progress
+            and not self.reset_in_progress
+        ):
+            self.no_detection_since = time.monotonic()
+        else:
+            self.no_detection_since = None
+
+    def _trigger_sensor_fault(self, message, kind="stuck_active"):
         if self.sensor_fault:
             return
 
         self.sensor_fault = True
+        self.sensor_fault_kind = kind
         self.sensor_fault_message = message
         self.sensor_active_since = None
+        self.no_detection_since = None
 
         # Fail closed: remove motion and cancel any automatic sequence.
         self.direction_timer.stop()
@@ -1073,20 +1156,42 @@ class StemConveyorGUI(QWidget):
         except Exception:
             pass
 
-        self._say(
-            "SENSOR FAULT. Belt is OFF. Check/clear the proximity sensor, "
-            "then press RESET SYSTEM."
-        )
+        if kind == "no_detection":
+            self._say(
+                "NO DETECTION. Belt is OFF. Check the stem feed and proximity "
+                "sensor, then press RESET SYSTEM."
+            )
+            dialog_title = "No Detection - Belt Stopped"
+            dialog_text = (
+                "No stem was detected within the allowed belt-run time. "
+                "The conveyor has been stopped and automatic operation is "
+                "locked out.\n\n"
+                f"{message}\n\n"
+                "This may mean no stem was fed, or the sensor/wiring may be "
+                "stuck CLEAR or disconnected. Check the feed and sensor, then "
+                "press RESET SYSTEM. The belt will remain OFF until START BELT "
+                "is pressed again."
+            )
+        else:
+            self._say(
+                "SENSOR FAULT. Belt is OFF. Check/clear the proximity sensor, "
+                "then press RESET SYSTEM."
+            )
+            dialog_title = "Sensor Fault - Belt Stopped"
+            dialog_text = (
+                "The proximity sensor remained ACTIVE for too long. The conveyor "
+                "has been stopped and automatic operation is locked out.\n\n"
+                f"{message}\n\n"
+                "Check for a stem blocking the sensor and inspect the sensor/wiring. "
+                "When the sensor is CLEAR, press RESET SYSTEM."
+            )
+
         self.update_status_display()
 
         QMessageBox.warning(
             self,
-            "Sensor Fault - Belt Stopped",
-            "The proximity sensor remained ACTIVE for too long. The conveyor "
-            "has been stopped and automatic operation is locked out.\n\n"
-            f"{message}\n\n"
-            "Check for a stem blocking the sensor and inspect the sensor/wiring. "
-            "When the sensor is CLEAR, press RESET SYSTEM.",
+            dialog_title,
+            dialog_text,
         )
 
     def _auto_capture_allowed(self):
@@ -1103,6 +1208,7 @@ class StemConveyorGUI(QWidget):
         self.capture_stage = self.STAGE_TRAVELING
         self.capture_source = "auto"
         self.restart_after_capture = True
+        self.no_detection_since = None
 
         self._say(
             f"Stem detected! Moving to the camera. "
@@ -1125,6 +1231,7 @@ class StemConveyorGUI(QWidget):
 
         self.hardware.conveyor_stop()
         self.conveyor_running = False
+        self.no_detection_since = None
         self.capture_stage = self.STAGE_SETTLING
 
         self._say(
@@ -1194,6 +1301,7 @@ class StemConveyorGUI(QWidget):
         self.hardware.conveyor_stop()
         self.conveyor_running = False
         self.system_running = False
+        self.no_detection_since = None
 
         self.capture_cycle_in_progress = False
         self.capture_stage = self.STAGE_IDLE
@@ -1243,8 +1351,12 @@ class StemConveyorGUI(QWidget):
         # the input is still ACTIVE.
         self.sensor_was_active = self.hardware.stem_detected()
         self.sensor_active_since = None
+        self._arm_no_detection_watchdog()
 
-        self._say("Photo saved. Belt restarted. Ready for the next stem!")
+        self._say(
+            "Photo saved. Belt restarted. Ready for the next stem! "
+            f"No-detection timeout: {NO_DETECTION_TIMEOUT_SEC:.0f} s."
+        )
         self.update_status_display()
 
     def cancel_capture_cycle(self):
@@ -1259,6 +1371,7 @@ class StemConveyorGUI(QWidget):
         self.capture_source = "auto"
         self.restart_after_capture = False
         self.pending_capture_path = None
+        self.no_detection_since = None
 
     # ========================================================
     # MANUAL PHOTO
@@ -1523,7 +1636,10 @@ class StemConveyorGUI(QWidget):
             self._set_status_color(self.system_value, "#d9822b")
 
         elif self.sensor_fault:
-            self.system_value.setText("SENSOR FAULT")
+            if self.sensor_fault_kind == "no_detection":
+                self.system_value.setText("NO DETECTION")
+            else:
+                self.system_value.setText("SENSOR FAULT")
             self._set_status_color(self.system_value, "#c44949")
 
         elif self.direction_change_in_progress:
@@ -1574,7 +1690,10 @@ class StemConveyorGUI(QWidget):
         detected = self.hardware.stem_detected()
 
         if self.sensor_fault:
-            self.sensor_value.setText("FAULT")
+            if self.sensor_fault_kind == "no_detection":
+                self.sensor_value.setText("CHECK SENSOR")
+            else:
+                self.sensor_value.setText("FAULT")
             self._set_status_color(self.sensor_value, "#c44949")
         elif detected:
             self.sensor_value.setText("STEM SEEN")
@@ -1639,6 +1758,7 @@ class StemConveyorGUI(QWidget):
         self.system_running = False
         self.conveyor_running = False
         self.sensor_active_since = None
+        self.no_detection_since = None
 
         try:
             self.hardware.conveyor_stop()

@@ -48,9 +48,15 @@ SENSOR_BOUNCE_TIME_SEC = 0.05
 
 # If the sensor stays continuously ACTIVE while the automatic system is
 # operating, treat it as a fault. This catches a sensor/output stuck HIGH or
-# an object that never clears the sensor. It cannot prove that a sensor stuck
-# permanently CLEAR is healthy; see README.md for that hardware limitation.
+# an object that never clears the sensor. The separate no-detection watchdog
+# below provides an operational check for the opposite failure direction.
 SENSOR_STUCK_ACTIVE_TIMEOUT_SEC = 5.0
+
+# If the belt is moving in an automatic-capture direction and no stem is
+# detected for this long, stop the conveyor and latch a NO DETECTION fault.
+# This helps catch a disconnected/stuck-CLEAR sensor, but it can also mean
+# that no stem was fed onto the belt. RESET SYSTEM is required before restart.
+NO_DETECTION_TIMEOUT_SEC = 30.0
 
 
 # ============================================================
