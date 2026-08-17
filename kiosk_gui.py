@@ -1,8 +1,16 @@
 import subprocess
 import time
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QTimer, QRectF, QSize
+from PySide6.QtGui import (
+    QColor,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -27,6 +35,42 @@ import hardware as hardware_module
 from developer_auth import DeveloperAuth
 from gui import StemConveyorGUI
 from runtime_settings import RuntimeSettings
+
+
+def make_power_icon(size=28):
+    """Return a vector-drawn power icon that does not depend on a font glyph."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    pen = QPen(QColor("#2e3b55"), max(2, size // 10))
+    pen.setCapStyle(Qt.RoundCap)
+    pen.setJoinStyle(Qt.RoundJoin)
+    painter.setPen(pen)
+
+    margin = size * 0.18
+    circle_rect = QRectF(
+        margin,
+        size * 0.24,
+        size - 2 * margin,
+        size - 2 * margin,
+    )
+
+    # 270-degree arc leaves the opening at the top.
+    painter.drawArc(circle_rect, 135 * 16, 270 * 16)
+
+    center_x = size / 2
+    painter.drawLine(
+        int(center_x),
+        int(size * 0.10),
+        int(center_x),
+        int(size * 0.48),
+    )
+
+    painter.end()
+    return QIcon(pixmap)
 
 
 class ConfigurationDialog(QDialog):
@@ -341,9 +385,11 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         except (TypeError, RuntimeError):
             pass
 
-        self.btn_exit.setText("⏻  SHUT DOWN")
-        self.btn_exit.setToolTip("Safely stop the conveyor and power off the Raspberry Pi.")
-        self.btn_exit.clicked.connect(self.shutdown_raspberry_pi)
+        self.btn_exit.setText("SHUT DOWN")
+        self.btn_exit.setIcon(make_power_icon(28))
+        self.btn_exit.setIconSize(QSize(28, 28))
+        self.btn_exit.setToolTip("Safely stop the conveyor and power off the imaging station.")
+        self.btn_exit.clicked.connect(self.shutdown_system)
 
     def _install_developer_shortcut(self):
         self.developer_shortcut = QShortcut(
@@ -357,11 +403,11 @@ class KioskStemConveyorGUI(StemConveyorGUI):
     # SHUTDOWN
     # ========================================================
 
-    def shutdown_raspberry_pi(self):
+    def shutdown_system(self):
         reply = QMessageBox.question(
             self,
             "Shut Down Imaging Station?",
-            "Shut down the entire Raspberry Pi?\n\n"
+            "Shut down the entire imaging station?\n\n"
             "The conveyor will be stopped first. Wait until the screen goes "
             "dark before removing power.",
             QMessageBox.Yes | QMessageBox.No,
@@ -387,7 +433,7 @@ class KioskStemConveyorGUI(StemConveyorGUI):
             QMessageBox.critical(
                 self,
                 "Shutdown Failed",
-                "The conveyor is OFF, but the Raspberry Pi shutdown command "
+                "The conveyor is OFF, but the shutdown command "
                 f"failed.\n\n{error}",
             )
             return
@@ -397,7 +443,7 @@ class KioskStemConveyorGUI(StemConveyorGUI):
             QMessageBox.critical(
                 self,
                 "Shutdown Failed",
-                "The conveyor is OFF, but the Raspberry Pi could not be "
+                "The conveyor is OFF, but the system could not be "
                 "powered off. Check the kiosk sudoers installation.\n\n"
                 f"{details}",
             )
@@ -543,11 +589,11 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         menu.setInformativeText("Choose an action.")
 
         config_button = menu.addButton(
-            "⚙ Configuration",
+            "Configuration",
             QMessageBox.ActionRole,
         )
         os_button = menu.addButton(
-            "🖥 Exit to Raspberry Pi OS",
+            "Exit to Desktop",
             QMessageBox.DestructiveRole,
         )
         menu.addButton("Cancel", QMessageBox.RejectRole)
@@ -558,7 +604,7 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         if clicked is config_button:
             self.open_developer_configuration()
         elif clicked is os_button:
-            self.exit_to_raspberry_pi_os()
+            self.exit_to_desktop()
 
     def open_developer_configuration(self):
         self.emergency_stop()
@@ -598,13 +644,13 @@ class KioskStemConveyorGUI(StemConveyorGUI):
             "The conveyor remains OFF and will not restart automatically.",
         )
 
-    def exit_to_raspberry_pi_os(self):
+    def exit_to_desktop(self):
         reply = QMessageBox.question(
             self,
-            "Exit to Raspberry Pi OS?",
-            "Exit the imaging application and show the Raspberry Pi desktop?\n\n"
+            "Exit to Desktop?",
+            "Exit the imaging application and show the desktop?\n\n"
             "The conveyor will remain OFF. The application will start again "
-            "automatically on the next Raspberry Pi boot/login.",
+            "automatically on the next system startup/login.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
