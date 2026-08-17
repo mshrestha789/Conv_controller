@@ -5,7 +5,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from config import APP_TITLE, FULLSCREEN
-from gui import StemConveyorGUI
+from kiosk_gui import KioskStemConveyorGUI
 from watchdog import ApplicationWatchdog
 
 
@@ -14,16 +14,15 @@ def main():
     app.setApplicationName(APP_TITLE)
     app.setStyle("Fusion")
 
-    # StemConveyorGUI constructs Hardware first, which immediately commands
-    # the active-low conveyor relay OFF before camera activity begins.
-    window = StemConveyorGUI()
+    # KioskStemConveyorGUI preserves the existing working conveyor GUI and
+    # adds shutdown/developer/configuration controls around it.
+    window = KioskStemConveyorGUI()
     watchdog = ApplicationWatchdog(app)
 
     cleanup_done = False
 
     def safe_cleanup():
         nonlocal cleanup_done
-
         if cleanup_done:
             return
 
@@ -39,10 +38,7 @@ def main():
         except Exception:
             pass
 
-    # Normal Qt shutdown.
     app.aboutToQuit.connect(safe_cleanup)
-
-    # Best effort for normal Python process exit.
     atexit.register(safe_cleanup)
 
     def exception_hook(exc_type, exc_value, traceback):
@@ -52,6 +48,10 @@ def main():
     sys.excepthook = exception_hook
 
     def signal_handler(signum, frame):
+        try:
+            window.allow_external_close()
+        except Exception:
+            pass
         safe_cleanup()
         app.quit()
 
@@ -63,10 +63,7 @@ def main():
     else:
         window.show()
 
-    # READY=1 and WATCHDOG=1 are sent only after the hardware object and GUI
-    # have been created. When run manually this is a harmless no-op.
     watchdog.start()
-
     raise SystemExit(app.exec())
 
 

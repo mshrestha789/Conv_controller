@@ -7,20 +7,19 @@ Type=notify
 WorkingDirectory=/home/conveyer/Conv_controller
 ExecStart=/usr/bin/python3 /home/conveyer/Conv_controller/main.py
 
-# The GUI sends WATCHDOG=1 from its main Qt event loop every ~1 second.
-# If the event loop freezes for 5 seconds, systemd treats the service as failed.
+# Main Qt event loop heartbeat. A frozen GUI becomes a service failure.
 WatchdogSec=5s
+
+# Crash/watchdog failures restart automatically. A developer's clean exit to
+# Raspberry Pi OS exits with status 0 and therefore stays stopped until the
+# next desktop login/boot autostarts it again.
 Restart=on-failure
 RestartSec=1s
 
-# Keep camera_worker.py in the same service cgroup so systemd also kills
-# child camera workers when stopping/restarting the application.
 KillMode=control-group
 TimeoutStopSec=3s
 
-# Optional extra software layer for both ACTIVE-LOW direction relays.
-# Tested configuration: GPIO22=FORWARD and GPIO27=REVERSE.
-# HIGH = relay OFF. Test these commands manually before enabling the service.
+# ACTIVE-LOW forward/reverse outputs: HIGH = relay OFF.
 ExecStartPre=/usr/bin/pinctrl 22 op dh
 ExecStartPre=/usr/bin/pinctrl 27 op dh
 ExecStopPost=/usr/bin/pinctrl 22 op dh

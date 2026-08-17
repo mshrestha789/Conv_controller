@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Stem Conveyor Imaging Station
+Comment=Start the conveyor kiosk after the Raspberry Pi desktop session is ready
+Exec=/home/conveyer/Conv_controller/systemd/start-kiosk.sh
+Terminal=false
+X-GNOME-Autostart-enabled=true
