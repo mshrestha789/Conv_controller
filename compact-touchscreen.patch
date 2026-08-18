@@ -1,0 +1,619 @@
+diff --git a/README.md b/README.md
+index 77f9dad..dfd783e 100644
+--- a/README.md
++++ b/README.md
+@@ -185,6 +185,21 @@ the camera worker is terminated, the belt stays OFF, and the operator is instruc
+ 
+ Do not unplug/reconnect the CSI ribbon while the Raspberry Pi is powered.
+ 
++## 7-inch touchscreen layout
++
++The GUI automatically selects a compact touchscreen layout when the primary
++display is 1100 pixels wide or less, or 650 pixels high or less. This includes
++the common 1024 Ã— 600 7-inch display.
++
++Compact mode keeps the machine-status cards, latest-photo preview, message
++banner, and five conveyor/camera controls on the main page. Saved-photo
++navigation, USB copy actions, and deletion are moved to a separate **PHOTOS**
++page so touch targets do not have to be reduced to fit the screen. Use
++**BACK TO CONTROLS** to return to the operating page.
++
++Larger monitors continue to use the original desktop layout with the preview,
++saved-photo list, and all controls visible together.
++
+ ## Application watchdog
+ 
+ `watchdog.py` sends systemd watchdog heartbeats from a `QTimer` in the **main Qt event loop**. When the supplied service is used:
+diff --git a/gui.py b/gui.py
+index 8fe3807..284ca99 100644
+--- a/gui.py
++++ b/gui.py
+@@ -5,6 +5,7 @@ import time
+ from PySide6.QtCore import Qt, QTimer
+ from PySide6.QtGui import QPixmap
+ from PySide6.QtWidgets import (
++    QApplication,
+     QWidget,
+     QLabel,
+     QPushButton,
+@@ -14,6 +15,8 @@ from PySide6.QtWidgets import (
+     QListWidget,
+     QListWidgetItem,
+     QFrame,
++    QStackedWidget,
++    QSizePolicy,
+ )
+ 
+ from config import (
+@@ -135,8 +138,25 @@ class StemConveyorGUI(QWidget):
+         # ====================================================
+ 
+         self.setWindowTitle(APP_TITLE)
+-        self.resize(1180, 760)
+-        self.setMinimumSize(900, 620)
++        screen = QApplication.primaryScreen()
++        screen_geometry = screen.availableGeometry() if screen else None
++        self.compact_mode = bool(
++            screen_geometry
++            and (
++                screen_geometry.width() <= 1100
++                or screen_geometry.height() <= 650
++            )
++        )
++
++        if self.compact_mode:
++            self.resize(
++                screen_geometry.width(),
++                screen_geometry.height(),
++            )
++            self.setMinimumSize(800, 480)
++        else:
++            self.resize(1180, 760)
++            self.setMinimumSize(900, 620)
+ 
+         self._build_ui()
+         self._apply_styles()
+@@ -193,127 +213,53 @@ class StemConveyorGUI(QWidget):
+     # ========================================================
+ 
+     def _build_ui(self):
+-        root = QVBoxLayout(self)
+-        root.setContentsMargins(18, 16, 18, 16)
+-        root.setSpacing(12)
++        self._create_ui_widgets()
+ 
+-        # ----------------------------------------------------
+-        # HEADER
+-        # ----------------------------------------------------
++        if self.compact_mode:
++            self._build_compact_ui()
++        else:
++            self._build_desktop_ui()
+ 
+-        header = QLabel("STEM IMAGING STATION")
+-        header.setObjectName("header")
+-        header.setAlignment(Qt.AlignCenter)
++        self._connect_ui_signals()
+ 
+-        subtitle = QLabel(
++    def _create_ui_widgets(self):
++        """Create shared widgets before arranging them for either display."""
++        self.header = QLabel("STEM IMAGING STATION")
++        self.header.setObjectName("header")
++        self.header.setAlignment(Qt.AlignCenter)
++
++        self.subtitle = QLabel(
+             "Place one stem at a time on the belt. "
+             "The system positions it, stops the belt, takes a photo, "
+             "and starts again automatically."
+         )
+-        subtitle.setObjectName("subtitle")
+-        subtitle.setAlignment(Qt.AlignCenter)
+-        subtitle.setWordWrap(True)
+-
+-        root.addWidget(header)
+-        root.addWidget(subtitle)
+-
+-        # ----------------------------------------------------
+-        # STATUS CARDS
+-        # ----------------------------------------------------
+-
+-        status_row = QHBoxLayout()
+-        status_row.setSpacing(10)
+-
+-        self.system_value = self._make_status_card(
+-            status_row,
+-            "SYSTEM",
+-            "READY",
+-        )
+-
+-        self.belt_value = self._make_status_card(
+-            status_row,
+-            "BELT",
+-            "STOPPED",
+-        )
+-
+-        self.sensor_value = self._make_status_card(
+-            status_row,
+-            "SENSOR",
+-            "CLEAR",
+-        )
+-
+-        self.photos_value = self._make_status_card(
+-            status_row,
+-            "PHOTOS",
+-            "0",
+-        )
+-
+-        self.usb_value = self._make_status_card(
+-            status_row,
+-            "USB",
+-            "NOT FOUND",
+-        )
+-
+-        root.addLayout(status_row)
+-
+-        # ----------------------------------------------------
+-        # MAIN CONTENT
+-        # ----------------------------------------------------
+-
+-        middle = QHBoxLayout()
+-        middle.setSpacing(14)
+-
+-        # Image preview
+-        preview_panel = QFrame()
+-        preview_panel.setObjectName("panel")
+-
+-        preview_layout = QVBoxLayout(preview_panel)
+-
+-        preview_title = QLabel("Latest Photo")
+-        preview_title.setObjectName("sectionTitle")
++        self.subtitle.setObjectName("subtitle")
++        self.subtitle.setAlignment(Qt.AlignCenter)
++        self.subtitle.setWordWrap(True)
+ 
+         self.image_preview = QLabel(
+             "No photos yet\n\nPress START BELT to begin."
+         )
+         self.image_preview.setObjectName("imagePreview")
+         self.image_preview.setAlignment(Qt.AlignCenter)
+-        self.image_preview.setMinimumSize(620, 360)
+-
+-        preview_layout.addWidget(preview_title)
+-        preview_layout.addWidget(self.image_preview, stretch=1)
+-
+-        # Photo list
+-        list_panel = QFrame()
+-        list_panel.setObjectName("panel")
+-
+-        list_layout = QVBoxLayout(list_panel)
+-
+-        list_title = QLabel("Saved Photos")
+-        list_title.setObjectName("sectionTitle")
+-
+-        list_hint = QLabel("Tap a photo to view it.")
+-        list_hint.setObjectName("smallHint")
++        self.image_preview.setSizePolicy(
++            QSizePolicy.Expanding,
++            QSizePolicy.Expanding,
++        )
+ 
+         self.image_list = QListWidget()
+         self.image_list.setObjectName("imageList")
+-        self.image_list.setMinimumWidth(300)
+-        self.image_list.itemClicked.connect(self.select_image_from_list)
+-
+-        list_layout.addWidget(list_title)
+-        list_layout.addWidget(list_hint)
+-        list_layout.addWidget(self.image_list, stretch=1)
+-
+-        middle.addWidget(preview_panel, stretch=3)
+-        middle.addWidget(list_panel, stretch=1)
+-
+-        root.addLayout(middle, stretch=1)
+-
+-        # ----------------------------------------------------
+-        # MAIN CONTROLS
+-        # ----------------------------------------------------
++        self.image_list.setSizePolicy(
++            QSizePolicy.Expanding,
++            QSizePolicy.Expanding,
++        )
+ 
+-        control_row = QHBoxLayout()
+-        control_row.setSpacing(10)
++        if self.compact_mode:
++            self.image_preview.setMinimumSize(0, 180)
++            self.image_list.setMinimumWidth(0)
++        else:
++            self.image_preview.setMinimumSize(620, 360)
++            self.image_list.setMinimumWidth(300)
+ 
+         self.btn_start = QPushButton("â–¶  START BELT")
+         self.btn_start.setObjectName("startButton")
+@@ -333,12 +279,72 @@ class StemConveyorGUI(QWidget):
+         self.btn_manual_capture = QPushButton("CAMERA  TAKE PHOTO")
+         self.btn_manual_capture.setObjectName("photoButton")
+ 
++        self.btn_prev = QPushButton("â—€ Previous")
++        self.btn_next = QPushButton("Next â–¶")
++        self.btn_copy_current = QPushButton("Save This to USB")
++        self.btn_copy_all = QPushButton("Save All to USB")
++        self.btn_delete = QPushButton("Delete Photo")
++        self.btn_exit = QPushButton("Exit")
++
++        self.btn_open_photos = QPushButton("PHOTOS")
++        self.btn_open_photos.setObjectName("photosButton")
++        self.btn_open_photos.setToolTip("Open saved-photo management.")
++
++        self.btn_back_to_main = QPushButton("â—€  BACK TO CONTROLS")
++        self.btn_back_to_main.setObjectName("backButton")
++
++        self.message_label = QLabel(
++            "Ready! Press START BELT when everyone is clear of the conveyor."
++        )
++        self.message_label.setObjectName("messageBanner")
++        self.message_label.setAlignment(Qt.AlignCenter)
++        self.message_label.setWordWrap(True)
++
++        self.auto_mode_label = QLabel(
++            f"Auto mode: detect stem â†’ move {SENSOR_TO_STOP_DELAY_SEC:.1f} s "
++            f"â†’ stop belt â†’ settle {BELT_SETTLE_DELAY_SEC:.1f} s "
++            f"â†’ photo â†’ restart. No detection for "
++            f"{NO_DETECTION_TIMEOUT_SEC:.0f} s â†’ belt stops."
++        )
++        self.auto_mode_label.setObjectName("smallHint")
++        self.auto_mode_label.setAlignment(Qt.AlignCenter)
++
++    def _connect_ui_signals(self):
+         self.btn_start.clicked.connect(self.start_system)
+         self.btn_stop.clicked.connect(self.stop_system)
+         self.btn_reset.clicked.connect(self.reset_system)
+         self.btn_direction.clicked.connect(self.toggle_direction)
+         self.btn_manual_capture.clicked.connect(self.manual_capture)
+ 
++        self.btn_prev.clicked.connect(self.previous_image)
++        self.btn_next.clicked.connect(self.next_image)
++        self.btn_copy_current.clicked.connect(self.copy_current_to_usb)
++        self.btn_copy_all.clicked.connect(self.copy_all_to_usb)
++        self.btn_delete.clicked.connect(self.delete_current_image)
++        self.btn_exit.clicked.connect(self.close)
++        self.image_list.itemClicked.connect(self.select_image_from_list)
++
++        self.btn_open_photos.clicked.connect(self._show_photo_page)
++        self.btn_back_to_main.clicked.connect(self._show_control_page)
++
++    def _build_desktop_ui(self):
++        root = QVBoxLayout(self)
++        root.setContentsMargins(18, 16, 18, 16)
++        root.setSpacing(12)
++
++        root.addWidget(self.header)
++        root.addWidget(self.subtitle)
++        root.addLayout(self._make_status_row(10))
++
++        middle = QHBoxLayout()
++        middle.setSpacing(14)
++        middle.addWidget(self._make_preview_panel(), stretch=3)
++        middle.addWidget(self._make_photo_list_panel(), stretch=1)
++
++        root.addLayout(middle, stretch=1)
++
++        control_row = QHBoxLayout()
++        control_row.setSpacing(10)
+         for button in (
+             self.btn_start,
+             self.btn_stop,
+@@ -351,27 +357,8 @@ class StemConveyorGUI(QWidget):
+ 
+         root.addLayout(control_row)
+ 
+-        # ----------------------------------------------------
+-        # PHOTO ACTIONS
+-        # ----------------------------------------------------
+-
+         photo_row = QHBoxLayout()
+         photo_row.setSpacing(8)
+-
+-        self.btn_prev = QPushButton("â—€ Previous")
+-        self.btn_next = QPushButton("Next â–¶")
+-        self.btn_copy_current = QPushButton("Save This to USB")
+-        self.btn_copy_all = QPushButton("Save All to USB")
+-        self.btn_delete = QPushButton("Delete Photo")
+-        self.btn_exit = QPushButton("Exit")
+-
+-        self.btn_prev.clicked.connect(self.previous_image)
+-        self.btn_next.clicked.connect(self.next_image)
+-        self.btn_copy_current.clicked.connect(self.copy_current_to_usb)
+-        self.btn_copy_all.clicked.connect(self.copy_all_to_usb)
+-        self.btn_delete.clicked.connect(self.delete_current_image)
+-        self.btn_exit.clicked.connect(self.close)
+-
+         for button in (
+             self.btn_prev,
+             self.btn_next,
+@@ -385,37 +372,173 @@ class StemConveyorGUI(QWidget):
+             photo_row.addWidget(button)
+ 
+         root.addLayout(photo_row)
++        root.addWidget(self.message_label)
++        root.addWidget(self.auto_mode_label)
+ 
+-        # ----------------------------------------------------
+-        # MESSAGE BANNER
+-        # ----------------------------------------------------
++    def _build_compact_ui(self):
++        root = QVBoxLayout(self)
++        root.setContentsMargins(8, 6, 8, 6)
++        root.setSpacing(6)
+ 
+-        self.message_label = QLabel(
+-            "Ready! Press START BELT when everyone is clear of the conveyor."
+-        )
+-        self.message_label.setObjectName("messageBanner")
+-        self.message_label.setAlignment(Qt.AlignCenter)
+-        self.message_label.setWordWrap(True)
++        header_row = QHBoxLayout()
++        header_row.setSpacing(8)
++        self.header.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
++        header_row.addWidget(self.header, stretch=1)
++
++        self.btn_open_photos.setMinimumSize(112, 42)
++        header_row.addWidget(self.btn_open_photos)
++
++        self.btn_exit.setObjectName("headerButton")
++        self.btn_exit.setMinimumSize(140, 42)
++        header_row.addWidget(self.btn_exit)
++        root.addLayout(header_row)
++
++        self.subtitle.hide()
++        self.auto_mode_label.hide()
++        root.addLayout(self._make_status_row(6))
+ 
++        self.compact_stack = QStackedWidget()
++        self.compact_stack.setObjectName("compactPages")
++
++        self.control_page = QWidget()
++        control_page_layout = QVBoxLayout(self.control_page)
++        control_page_layout.setContentsMargins(0, 0, 0, 0)
++        control_page_layout.setSpacing(6)
++        control_page_layout.addWidget(self._make_preview_panel(), stretch=1)
++
++        control_row = QHBoxLayout()
++        control_row.setSpacing(6)
++        for button in (
++            self.btn_start,
++            self.btn_stop,
++            self.btn_reset,
++            self.btn_direction,
++            self.btn_manual_capture,
++        ):
++            button.setMinimumHeight(54)
++            control_row.addWidget(button, stretch=1)
++        control_page_layout.addLayout(control_row)
++
++        self.photo_page = QWidget()
++        photo_page_layout = QVBoxLayout(self.photo_page)
++        photo_page_layout.setContentsMargins(0, 0, 0, 0)
++        photo_page_layout.setSpacing(6)
++
++        photo_header = QHBoxLayout()
++        photo_title = QLabel("SAVED PHOTOS")
++        photo_title.setObjectName("photoPageTitle")
++        photo_header.addWidget(photo_title)
++        photo_header.addStretch(1)
++        self.btn_back_to_main.setMinimumSize(190, 42)
++        photo_header.addWidget(self.btn_back_to_main)
++        photo_page_layout.addLayout(photo_header)
++        photo_page_layout.addWidget(self._make_photo_list_panel(), stretch=1)
++
++        photo_actions = QHBoxLayout()
++        photo_actions.setSpacing(6)
++        for button in (
++            self.btn_prev,
++            self.btn_next,
++            self.btn_copy_current,
++            self.btn_copy_all,
++            self.btn_delete,
++        ):
++            button.setMinimumHeight(48)
++            button.setObjectName("smallButton")
++            photo_actions.addWidget(button, stretch=1)
++        photo_page_layout.addLayout(photo_actions)
++
++        self.compact_stack.addWidget(self.control_page)
++        self.compact_stack.addWidget(self.photo_page)
++        self.compact_stack.setCurrentWidget(self.control_page)
++        root.addWidget(self.compact_stack, stretch=1)
+         root.addWidget(self.message_label)
+ 
+-        self.auto_mode_label = QLabel(
+-            f"Auto mode: detect stem â†’ move {SENSOR_TO_STOP_DELAY_SEC:.1f} s "
+-            f"â†’ stop belt â†’ settle {BELT_SETTLE_DELAY_SEC:.1f} s "
+-            f"â†’ photo â†’ restart. No detection for {NO_DETECTION_TIMEOUT_SEC:.0f} s â†’ belt stops."
++    def _make_status_row(self, spacing):
++        status_row = QHBoxLayout()
++        status_row.setSpacing(spacing)
++
++        self.system_value = self._make_status_card(
++            status_row, "SYSTEM", "READY"
+         )
+-        self.auto_mode_label.setObjectName("smallHint")
+-        self.auto_mode_label.setAlignment(Qt.AlignCenter)
++        self.belt_value = self._make_status_card(
++            status_row, "BELT", "STOPPED"
++        )
++        self.sensor_value = self._make_status_card(
++            status_row, "SENSOR", "CLEAR"
++        )
++        self.photos_value = self._make_status_card(
++            status_row, "PHOTOS", "0"
++        )
++        self.usb_value = self._make_status_card(
++            status_row, "USB", "NOT FOUND"
++        )
++        return status_row
+ 
+-        root.addWidget(self.auto_mode_label)
++    def _make_preview_panel(self):
++        preview_panel = QFrame()
++        preview_panel.setObjectName("panel")
++        preview_layout = QVBoxLayout(preview_panel)
++
++        if self.compact_mode:
++            preview_layout.setContentsMargins(8, 5, 8, 8)
++            preview_layout.setSpacing(4)
++
++        preview_title = QLabel("Latest Photo")
++        preview_title.setObjectName("sectionTitle")
++        preview_layout.addWidget(preview_title)
++        preview_layout.addWidget(self.image_preview, stretch=1)
++        return preview_panel
++
++    def _make_photo_list_panel(self):
++        list_panel = QFrame()
++        list_panel.setObjectName("panel")
++        list_layout = QVBoxLayout(list_panel)
++
++        if self.compact_mode:
++            list_layout.setContentsMargins(8, 5, 8, 8)
++            list_layout.setSpacing(4)
++
++        list_title = QLabel("Saved Photos")
++        list_title.setObjectName("sectionTitle")
++        list_hint = QLabel(
++            "Tap a photo to select it. Return to Controls to view it."
++            if self.compact_mode
++            else "Tap a photo to view it."
++        )
++        list_hint.setObjectName("smallHint")
++        list_layout.addWidget(list_title)
++        list_layout.addWidget(list_hint)
++        list_layout.addWidget(self.image_list, stretch=1)
++        return list_panel
++
++    def _show_photo_page(self):
++        if not self.compact_mode:
++            return
++
++        self.refresh_image_list()
++        self.compact_stack.setCurrentWidget(self.photo_page)
++        self.btn_open_photos.setEnabled(False)
++
++    def _show_control_page(self):
++        if not self.compact_mode:
++            return
++
++        self.compact_stack.setCurrentWidget(self.control_page)
++        self.btn_open_photos.setEnabled(True)
++        self.show_current_image()
+ 
+     def _make_status_card(self, layout, title, value):
+         card = QFrame()
+         card.setObjectName("statusCard")
+ 
+         card_layout = QVBoxLayout(card)
+-        card_layout.setContentsMargins(8, 7, 8, 7)
+-        card_layout.setSpacing(2)
++        if self.compact_mode:
++            card_layout.setContentsMargins(6, 3, 6, 3)
++            card_layout.setSpacing(0)
++        else:
++            card_layout.setContentsMargins(8, 7, 8, 7)
++            card_layout.setSpacing(2)
+ 
+         title_label = QLabel(title)
+         title_label.setObjectName("statusTitle")
+@@ -609,6 +732,92 @@ class StemConveyorGUI(QWidget):
+             """
+         )
+ 
++        if self.compact_mode:
++            self.setStyleSheet(
++                self.styleSheet()
++                + """
++                QLabel#header {
++                    font-size: 22px;
++                    padding: 0;
++                }
++
++                QFrame#statusCard {
++                    border-radius: 8px;
++                }
++
++                QLabel#statusTitle {
++                    font-size: 10px;
++                }
++
++                QLabel#statusValue {
++                    font-size: 14px;
++                }
++
++                QFrame#panel {
++                    border-radius: 9px;
++                }
++
++                QLabel#sectionTitle,
++                QLabel#photoPageTitle {
++                    color: #253858;
++                    font-size: 15px;
++                    font-weight: 800;
++                }
++
++                QLabel#smallHint {
++                    font-size: 12px;
++                }
++
++                QLabel#imagePreview {
++                    border-radius: 8px;
++                    font-size: 15px;
++                    padding: 4px;
++                }
++
++                QListWidget#imageList {
++                    font-size: 14px;
++                    padding: 3px;
++                }
++
++                QListWidget#imageList::item {
++                    min-height: 40px;
++                    padding: 4px;
++                }
++
++                QPushButton {
++                    border-radius: 8px;
++                    font-size: 13px;
++                    padding: 6px 8px;
++                }
++
++                QPushButton#smallButton {
++                    font-size: 13px;
++                }
++
++                QPushButton#photosButton,
++                QPushButton#backButton,
++                QPushButton#headerButton {
++                    background-color: #e8edf6;
++                    color: #2e3b55;
++                    border: 1px solid #d3dbe9;
++                    font-size: 13px;
++                    font-weight: 800;
++                }
++
++                QPushButton#photosButton:hover,
++                QPushButton#backButton:hover,
++                QPushButton#headerButton:hover {
++                    background-color: #dce5f3;
++                }
++
++                QLabel#messageBanner {
++                    border-radius: 8px;
++                    font-size: 14px;
++                    padding: 6px;
++                }
++                """
++            )
++
+     # ========================================================
+     # SYSTEM CONTROL
+     # ========================================================
