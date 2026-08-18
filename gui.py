@@ -261,26 +261,26 @@ class StemConveyorGUI(QWidget):
             self.image_preview.setMinimumSize(620, 360)
             self.image_list.setMinimumWidth(300)
 
-        self.btn_start = QPushButton("â–¶  START BELT")
+        self.btn_start = QPushButton("▶  START BELT")
         self.btn_start.setObjectName("startButton")
 
-        self.btn_stop = QPushButton("â–   STOP BELT")
+        self.btn_stop = QPushButton("■  STOP BELT")
         self.btn_stop.setObjectName("stopButton")
 
-        self.btn_reset = QPushButton("â†»  RESET SYSTEM")
+        self.btn_reset = QPushButton("↻  RESET SYSTEM")
         self.btn_reset.setObjectName("resetButton")
         self.btn_reset.setToolTip(
             "Stops the conveyor, clears the current cycle, and restarts the camera."
         )
 
-        self.btn_direction = QPushButton("â†”  CHANGE DIRECTION")
+        self.btn_direction = QPushButton("↔  CHANGE DIRECTION")
         self.btn_direction.setObjectName("directionButton")
 
         self.btn_manual_capture = QPushButton("CAMERA  TAKE PHOTO")
         self.btn_manual_capture.setObjectName("photoButton")
 
-        self.btn_prev = QPushButton("â—€ Previous")
-        self.btn_next = QPushButton("Next â–¶")
+        self.btn_prev = QPushButton("◀ Previous")
+        self.btn_next = QPushButton("Next ▶")
         self.btn_copy_current = QPushButton("Save This to USB")
         self.btn_copy_all = QPushButton("Save All to USB")
         self.btn_delete = QPushButton("Delete Photo")
@@ -290,7 +290,7 @@ class StemConveyorGUI(QWidget):
         self.btn_open_photos.setObjectName("photosButton")
         self.btn_open_photos.setToolTip("Open saved-photo management.")
 
-        self.btn_back_to_main = QPushButton("â—€  BACK TO CONTROLS")
+        self.btn_back_to_main = QPushButton("◀  BACK TO CONTROLS")
         self.btn_back_to_main.setObjectName("backButton")
 
         self.message_label = QLabel(
@@ -301,10 +301,10 @@ class StemConveyorGUI(QWidget):
         self.message_label.setWordWrap(True)
 
         self.auto_mode_label = QLabel(
-            f"Auto mode: detect stem â†’ move {SENSOR_TO_STOP_DELAY_SEC:.1f} s "
-            f"â†’ stop belt â†’ settle {BELT_SETTLE_DELAY_SEC:.1f} s "
-            f"â†’ photo â†’ restart. No detection for "
-            f"{NO_DETECTION_TIMEOUT_SEC:.0f} s â†’ belt stops."
+            f"Auto mode: detect stem → move {SENSOR_TO_STOP_DELAY_SEC:.1f} s "
+            f"→ stop belt → settle {BELT_SETTLE_DELAY_SEC:.1f} s "
+            f"→ photo → restart. No detection for "
+            f"{NO_DETECTION_TIMEOUT_SEC:.0f} s → belt stops."
         )
         self.auto_mode_label.setObjectName("smallHint")
         self.auto_mode_label.setAlignment(Qt.AlignCenter)
@@ -1086,20 +1086,20 @@ class StemConveyorGUI(QWidget):
 
     def _update_direction_button(self):
         if self.reset_in_progress:
-            self.btn_direction.setText("â†”  WAIT FOR RESET")
+            self.btn_direction.setText("↔  WAIT FOR RESET")
             self.btn_direction.setEnabled(False)
             return
 
         if self.sensor_fault:
             if self.sensor_fault_kind == "no_detection":
-                self.btn_direction.setText("â†”  CHECK SENSOR")
+                self.btn_direction.setText("↔  CHECK SENSOR")
             else:
-                self.btn_direction.setText("â†”  SENSOR FAULT")
+                self.btn_direction.setText("↔  SENSOR FAULT")
             self.btn_direction.setEnabled(False)
             return
 
         if not self.hardware.reverse_configured:
-            self.btn_direction.setText("â†”  REVERSE NOT SET UP")
+            self.btn_direction.setText("↔  REVERSE NOT SET UP")
             self.btn_direction.setEnabled(False)
             self.btn_direction.setToolTip(
                 "Set REVERSE_RELAY_PIN in config.py after confirming the wiring."
@@ -1107,21 +1107,21 @@ class StemConveyorGUI(QWidget):
             return
 
         if self.direction_change_in_progress:
-            self.btn_direction.setText("â†”  CHANGING...")
+            self.btn_direction.setText("↔  CHANGING...")
             self.btn_direction.setEnabled(False)
             return
 
         if self.capture_cycle_in_progress:
-            self.btn_direction.setText("â†”  WAIT FOR PHOTO")
+            self.btn_direction.setText("↔  WAIT FOR PHOTO")
             self.btn_direction.setEnabled(False)
             return
 
         self.btn_direction.setEnabled(True)
 
         if self.selected_direction == "forward":
-            self.btn_direction.setText("â†”  SWITCH TO REVERSE")
+            self.btn_direction.setText("↔  SWITCH TO REVERSE")
         else:
-            self.btn_direction.setText("â†”  SWITCH TO FORWARD")
+            self.btn_direction.setText("↔  SWITCH TO FORWARD")
 
     # ========================================================
     # CAMERA STATE
@@ -1888,7 +1888,7 @@ class StemConveyorGUI(QWidget):
 
         else:
             self.belt_value.setText(
-                f"STOPPED â€¢ {self.selected_direction.upper()}"
+                f"STOPPED • {self.selected_direction.upper()}"
             )
             self._set_status_color(self.belt_value, "#c44949")
 
