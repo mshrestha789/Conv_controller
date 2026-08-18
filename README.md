@@ -51,27 +51,27 @@ Both forward and reverse outputs are commanded OFF before another direction is s
 
 ```text
 START BELT
-    â†“
+    ↓
 Start no-detection timer
-    â†“
+    ↓
 Sensor detects one stem
-    â†“
+    ↓
 Cancel no-detection timer
-    â†“
+    ↓
 Move for SENSOR_TO_STOP_DELAY_SEC
-    â†“
+    ↓
 CONVEYOR OFF
-    â†“
+    ↓
 Wait BELT_SETTLE_DELAY_SEC
-    â†“
+    ↓
 Capture using already-initialized camera worker
-    â†“
-Photo succeeds? â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ No / timeout
-    â†“                           â†“
+    ↓
+Photo succeeds? ───────────── No / timeout
+    ↓                           ↓
 Wait POST_CAPTURE_DELAY_SEC    BELT STAYS OFF
-    â†“                           â†“
+    ↓                           ↓
 Restart belt                   RESET SYSTEM required
-    â†“
+    ↓
 Start a fresh no-detection timer
 ```
 
@@ -89,21 +89,21 @@ the program latches a sensor fault:
 
 ```text
 Sensor remains ACTIVE too long
-        â†“
+        ↓
 SENSOR FAULT
-        â†“
+        ↓
 Cancel positioning/photo/restart sequence
-        â†“
+        ↓
 Forward and reverse outputs OFF
-        â†“
+        ↓
 Belt remains stopped
-        â†“
+        ↓
 START BELT disabled
-        â†“
+        ↓
 Check/remove obstruction or inspect sensor/wiring
-        â†“
+        ↓
 Press RESET SYSTEM
-        â†“
+        ↓
 Fault clears only if sensor input is CLEAR
 ```
 
@@ -121,21 +121,21 @@ the belt stops and a `NO DETECTION` fault is latched:
 
 ```text
 Belt running
-    â†“
+    ↓
 No stem detection for 30 s
-    â†“
+    ↓
 NO DETECTION
-    â†“
+    ↓
 Forward and reverse outputs OFF
-    â†“
+    ↓
 Belt remains stopped
-    â†“
+    ↓
 Check stem feed and proximity sensor/wiring
-    â†“
+    ↓
 Press RESET SYSTEM
-    â†“
+    ↓
 Belt still remains stopped
-    â†“
+    ↓
 Press START BELT when ready
 ```
 
@@ -189,7 +189,7 @@ Do not unplug/reconnect the CSI ribbon while the Raspberry Pi is powered.
 
 The GUI automatically selects a compact touchscreen layout when the primary
 display is 1100 pixels wide or less, or 650 pixels high or less. This includes
-the common 1024 Ã— 600 7-inch display.
+the common 1024 × 600 7-inch display.
 
 Compact mode keeps the machine-status cards, latest-photo preview, message
 banner, and five conveyor/camera controls on the main page. Saved-photo
@@ -234,19 +234,19 @@ kernel_watchdog_timeout=15
 
 ```text
 Conv_controller/
-â”œâ”€â”€ main.py
-â”œâ”€â”€ config.py
-â”œâ”€â”€ gui.py
-â”œâ”€â”€ hardware.py
-â”œâ”€â”€ camera.py
-â”œâ”€â”€ camera_worker.py
-â”œâ”€â”€ watchdog.py
-â”œâ”€â”€ storage.py
-â”œâ”€â”€ README.md
-â””â”€â”€ systemd/
-    â”œâ”€â”€ stem-conveyor.service
-    â”œâ”€â”€ 10-hardware-watchdog.conf
-    â””â”€â”€ config.txt-snippet
+├── main.py
+├── config.py
+├── gui.py
+├── hardware.py
+├── camera.py
+├── camera_worker.py
+├── watchdog.py
+├── storage.py
+├── README.md
+└── systemd/
+    ├── stem-conveyor.service
+    ├── 10-hardware-watchdog.conf
+    └── config.txt-snippet
 ```
 
 `storage.py` remains unchanged by this amendment.
