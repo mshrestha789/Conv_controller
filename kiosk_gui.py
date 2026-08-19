@@ -18,14 +18,17 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 import camera as camera_module
@@ -87,14 +90,45 @@ class ConfigurationDialog(QDialog):
 
         self.setWindowTitle("Developer Configuration")
         self.setModal(True)
-        self.resize(600, 620)
+
+        # Keep the dialog inside the usable display area. A fixed 620-pixel
+        # height is too tall for a 1024 x 600 touchscreen after window
+        # decorations are included.
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            dialog_width = min(760, max(1, available.width() - 40))
+            dialog_height = min(620, max(1, available.height() - 70))
+            self.resize(dialog_width, dialog_height)
+            self.setMinimumSize(
+                min(520, dialog_width),
+                min(360, dialog_height),
+            )
+        else:
+            self.resize(600, 520)
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        # Only the settings content scrolls. The action buttons remain fixed
+        # and visible at the bottom of the dialog on small touchscreens.
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget(scroll_area)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(4, 4, 8, 4)
+        content_layout.setSpacing(8)
+        scroll_area.setWidget(content)
+        root.addWidget(scroll_area, 1)
 
         title = QLabel("DEVELOPER CONFIGURATION")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("font-size: 22px; font-weight: 800;")
-        root.addWidget(title)
+        content_layout.addWidget(title)
 
         info = QLabel(
             "The conveyor is stopped while this page is open. "
@@ -102,10 +136,10 @@ class ConfigurationDialog(QDialog):
         )
         info.setWordWrap(True)
         info.setStyleSheet("padding: 8px; color: #52637a;")
-        root.addWidget(info)
+        content_layout.addWidget(info)
 
         form = QFormLayout()
-        form.setSpacing(12)
+        form.setSpacing(8)
 
         self.sensor_polarity = QComboBox()
         self.sensor_polarity.addItem("Active LOW", False)
@@ -173,7 +207,7 @@ class ConfigurationDialog(QDialog):
         )
         form.addRow("Camera capture timeout", self.camera_timeout)
 
-        root.addLayout(form)
+        content_layout.addLayout(form)
 
         hardware_summary = QLabel(
             f"Locked hardware: Sensor GPIO {config.PROXIMITY_PIN} • "
@@ -185,28 +219,30 @@ class ConfigurationDialog(QDialog):
         hardware_summary.setStyleSheet(
             "background: #eef2f7; padding: 8px; border-radius: 6px;"
         )
-        root.addWidget(hardware_summary)
+        content_layout.addWidget(hardware_summary)
 
         self.sensor_test = QLabel("Sensor input: checking...")
         self.sensor_test.setAlignment(Qt.AlignCenter)
         self.sensor_test.setStyleSheet(
             "font-size: 16px; font-weight: 700; padding: 8px;"
         )
-        root.addWidget(self.sensor_test)
+        content_layout.addWidget(self.sensor_test)
 
+        # Keep every action outside the scrolling region so the operator can
+        # always save, cancel, or restore defaults without hidden controls.
         action_row = QHBoxLayout()
         restore_button = QPushButton("Restore Defaults")
         restore_button.clicked.connect(self._restore_defaults)
         action_row.addWidget(restore_button)
         action_row.addStretch(1)
-        root.addLayout(action_row)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        action_row.addWidget(buttons)
+        root.addLayout(action_row)
 
         self.sensor_timer = QTimer(self)
         self.sensor_timer.timeout.connect(self._update_sensor_test)
