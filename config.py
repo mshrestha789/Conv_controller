@@ -114,9 +114,12 @@ USB_IMAGE_FOLDER = "stem_images"
 # DEVELOPER / KIOSK MODE
 # ============================================================
 
-# Hidden shortcut. The PIN is NOT stored here. On first use the developer
-# creates a PIN, which is stored as a salted PBKDF2 hash in DEVELOPER_AUTH_FILE.
+# Developer access is available by holding the main title on the touchscreen
+# or by using the hidden keyboard shortcut. The PIN is NOT stored here. On
+# first use the developer creates a PIN, which is stored as a salted PBKDF2
+# hash in DEVELOPER_AUTH_FILE.
 DEVELOPER_SHORTCUT = "Ctrl+Alt+Shift+D"
+DEVELOPER_TOUCH_HOLD_MS = 5000
 DEVELOPER_AUTH_FILE = Path.home() / "stem_conveyor" / "developer_auth.json"
 RUNTIME_SETTINGS_FILE = Path.home() / "stem_conveyor" / "settings.json"
 

@@ -237,19 +237,219 @@ Conv_controller/
 ├── main.py
 ├── config.py
 ├── gui.py
+├── kiosk_gui.py
 ├── hardware.py
 ├── camera.py
 ├── camera_worker.py
 ├── watchdog.py
 ├── storage.py
+├── runtime_settings.py
+├── developer_auth.py
+├── install_kiosk.sh
+├── KIOSK_SETUP.md
 ├── README.md
 └── systemd/
     ├── stem-conveyor.service
+    ├── stem-conveyor-autostart.desktop
+    ├── start-kiosk.sh
     ├── 10-hardware-watchdog.conf
     └── config.txt-snippet
 ```
 
-`storage.py` remains unchanged by this amendment.
+## Install on a new Raspberry Pi
+
+These instructions match the supplied kiosk service and autostart files.
+
+> **Required username:** create the Raspberry Pi OS user as `conveyer`.
+> The current service files use the absolute path
+> `/home/conveyer/Conv_controller`. A different username will prevent kiosk
+> startup unless the paths in `systemd/stem-conveyor.service` and
+> `systemd/stem-conveyor-autostart.desktop` are changed before installation.
+
+### 1. Install Raspberry Pi OS
+
+Use Raspberry Pi Imager to install the current **64-bit Raspberry Pi OS with
+Desktop**. In the Imager settings:
+
+- set the username to `conveyer`;
+- configure Wi-Fi and locale if required;
+- optionally enable SSH for maintenance;
+- boot to the graphical desktop and complete the initial setup.
+
+The desktop version is required because the kiosk service starts after the
+graphical desktop session becomes available.
+
+### 2. Update the OS and install dependencies
+
+Open a terminal and run:
+
+```bash
+sudo apt update
+sudo apt full-upgrade -y
+sudo apt install -y \
+    git \
+    python3-gpiozero \
+    python3-picamera2 \
+    python3-pyside6.qtwidgets \
+    raspi-utils \
+    rpicam-apps
+```
+
+The `python3-pyside6.qtwidgets` package installs the required QtCore and QtGui
+dependencies. This project runs with `/usr/bin/python3`, so use OS packages
+instead of installing packages into an unrelated Python virtual environment.
+If `apt` cannot locate `python3-pyside6.qtwidgets`, the OS image is too old for
+this installation procedure. Install the current 64-bit Raspberry Pi OS with
+Desktop rather than replacing PySide6 with PyQt, because this source code
+imports PySide6 directly.
+
+Verify the Python modules:
+
+```bash
+python3 - <<'PY'
+from PySide6.QtWidgets import QApplication
+from gpiozero import DigitalInputDevice, OutputDevice
+from picamera2 import Picamera2
+
+print("Python dependencies are available.")
+PY
+```
+
+### 3. Connect and verify the camera
+
+Shut down and disconnect power before connecting or moving the CSI ribbon.
+For the Arducam 64 MP camera, install the overlay/tuning configuration required
+by that specific Arducam model. Do not remove working Arducam overlay lines
+from `/boot/firmware/config.txt`.
+
+After reconnecting power, verify camera detection:
+
+```bash
+rpicam-hello --list-cameras
+rpicam-jpeg -o ~/camera-test.jpg
+```
+
+Do not continue to motor testing until the camera is listed and the test image
+is created successfully.
+
+### 4. Clone the application
+
+```bash
+cd ~
+git clone https://github.com/mshrestha789/Conv_controller.git
+cd ~/Conv_controller
+```
+
+If the directory already exists, do not clone over it. Update it instead:
+
+```bash
+cd ~/Conv_controller
+git pull
+```
+
+### 5. Configure safe GPIO startup and the hardware watchdog
+
+Open the boot configuration:
+
+```bash
+sudo nano /boot/firmware/config.txt
+```
+
+Keep the existing camera configuration and add these lines once:
+
+```text
+gpio=22=op,dh
+gpio=27=op,dh
+kernel_watchdog_timeout=15
+```
+
+For this active-low relay configuration, `dh` requests GPIO HIGH, which is the
+relay-OFF state during boot.
+
+Install the systemd hardware-watchdog configuration:
+
+```bash
+sudo install -D -m 0644 \
+    systemd/10-hardware-watchdog.conf \
+    /etc/systemd/system.conf.d/10-hardware-watchdog.conf
+```
+
+### 6. Enable desktop autologin and install kiosk startup
+
+Run:
+
+```bash
+sudo raspi-config
+```
+
+Select **System Options -> Boot / Auto Login -> Desktop Autologin**, then exit
+without rebooting yet.
+
+Install the user service, desktop autostart entry, and restricted shutdown
+permission:
+
+```bash
+cd ~/Conv_controller
+chmod +x install_kiosk.sh systemd/start-kiosk.sh
+./install_kiosk.sh
+```
+
+The installer creates:
+
+```text
+~/.config/systemd/user/stem-conveyor.service
+~/.config/autostart/stem-conveyor.desktop
+/etc/sudoers.d/stem-conveyor-poweroff
+```
+
+The service is intentionally started by desktop autostart rather than enabled
+directly. Therefore, desktop autologin must work for automatic kiosk startup.
+
+### 7. Verify before connecting motor power
+
+Keep the motor/high-power circuit disabled if possible. Check Python syntax and
+start the GUI manually:
+
+```bash
+cd ~/Conv_controller
+python3 -m py_compile *.py
+python3 main.py
+```
+
+Verify the following before enabling motor power:
+
+1. the GUI fits the touchscreen;
+2. the camera status becomes ready;
+3. the sensor CLEAR/DETECTED state matches the physical input;
+4. forward and reverse relay outputs are never active together;
+5. active-low relay OFF corresponds to GPIO HIGH;
+6. holding `STEM IMAGING STATION` for 5 seconds opens the on-screen developer
+   PIN keypad after the title is released.
+
+Use the protected developer menu to exit the manually started application, or
+press `Ctrl+C` in the launch terminal.
+
+### 8. Reboot and verify automatic startup
+
+```bash
+sudo reboot
+```
+
+After login, the application should open automatically in full-screen kiosk
+mode. If it does not, inspect the user service:
+
+```bash
+systemctl --user status stem-conveyor.service --no-pager
+journalctl --user -u stem-conveyor.service -b -n 100 --no-pager
+```
+
+After pulling later code updates, restart the running application with:
+
+```bash
+cd ~/Conv_controller
+git pull
+systemctl --user restart stem-conveyor.service
+```
 
 ## Run manually
 

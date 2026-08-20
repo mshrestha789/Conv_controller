@@ -13,12 +13,16 @@ unchanged.
 - The visible `Exit` button becomes `SHUT DOWN` and powers off the Pi only
   after commanding the conveyor OFF.
 - Normal window close / Alt+F4 is ignored by the application.
-- Hidden developer shortcut: `Ctrl+Alt+Shift+D`.
-- First use of the developer shortcut asks you to create a 4–12 digit PIN.
+- Touch access: press and hold `STEM IMAGING STATION` for 5 seconds, then
+  release it.
+- Backup keyboard shortcut: `Ctrl+Alt+Shift+D`.
+- Developer PIN entry uses the application's on-screen numeric keypad, so an
+  operating-system keyboard is not required.
+- First use asks you to create a 4-12 digit PIN.
   Only a salted PBKDF2 hash is stored.
 - After authentication, the Developer Menu offers:
   - **Configuration**
-  - **Exit to Raspberry Pi OS**
+  - **Exit to Desktop**
   - **Cancel**
 - Developer Configuration stops the conveyor and lets you change operational
   calibration without editing Python source.
@@ -98,14 +102,18 @@ sudo reboot
 
 ## First developer login
 
-While the full-screen conveyor application has focus, press:
+On the touchscreen, press and hold the `STEM IMAGING STATION` title for 5
+seconds. Release the title when instructed. The on-screen numeric PIN keypad
+will open.
+
+Alternatively, while the full-screen conveyor application has focus, press:
 
 ```text
 Ctrl + Alt + Shift + D
 ```
 
-On the first use, create your developer PIN. On later uses, enter that PIN to
-open the Developer Menu.
+On the first use, create and confirm your developer PIN using the on-screen
+keypad. On later uses, enter that PIN to open the Developer Menu.
 
 If you forget the developer PIN, remove this file from a developer shell/SSH
 session and create a new PIN on the next shortcut use:

@@ -1,7 +1,7 @@
 import subprocess
 import time
 
-from PySide6.QtCore import Qt, QTimer, QRectF, QSize
+from PySide6.QtCore import QEvent, Qt, QTimer, QRectF, QSize
 from PySide6.QtGui import (
     QColor,
     QIcon,
@@ -19,8 +19,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -74,6 +74,119 @@ def make_power_icon(size=28):
 
     painter.end()
     return QIcon(pixmap)
+
+
+class PinEntryDialog(QDialog):
+    """Touch-friendly numeric PIN entry with an integrated keypad."""
+
+    def __init__(self, parent, title, prompt, accept_text="Enter"):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            dialog_width = min(460, max(1, available.width() - 80))
+            dialog_height = min(540, max(1, available.height() - 80))
+            self.resize(dialog_width, dialog_height)
+            self.setMinimumSize(
+                min(360, dialog_width),
+                min(420, dialog_height),
+            )
+        else:
+            self.resize(420, 520)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
+
+        prompt_label = QLabel(prompt)
+        prompt_label.setAlignment(Qt.AlignCenter)
+        prompt_label.setWordWrap(True)
+        prompt_label.setStyleSheet("font-size: 18px; font-weight: 700;")
+        root.addWidget(prompt_label)
+
+        self.pin_edit = QLineEdit()
+        self.pin_edit.setEchoMode(QLineEdit.Password)
+        self.pin_edit.setMaxLength(12)
+        self.pin_edit.setAlignment(Qt.AlignCenter)
+        self.pin_edit.setInputMethodHints(
+            Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText | Qt.ImhSensitiveData
+        )
+        self.pin_edit.setMinimumHeight(52)
+        self.pin_edit.setStyleSheet("font-size: 26px; padding: 6px;")
+        self.pin_edit.textChanged.connect(self._sanitize_pin)
+        root.addWidget(self.pin_edit)
+
+        keypad = QGridLayout()
+        keypad.setSpacing(8)
+
+        for index, digit in enumerate("123456789"):
+            button = self._key_button(digit)
+            button.clicked.connect(
+                lambda checked=False, value=digit: self._append_digit(value)
+            )
+            keypad.addWidget(button, index // 3, index % 3)
+
+        clear_button = self._key_button("Clear")
+        clear_button.clicked.connect(self.pin_edit.clear)
+        keypad.addWidget(clear_button, 3, 0)
+
+        zero_button = self._key_button("0")
+        zero_button.clicked.connect(
+            lambda checked=False: self._append_digit("0")
+        )
+        keypad.addWidget(zero_button, 3, 1)
+
+        backspace_button = self._key_button("Backspace")
+        backspace_button.clicked.connect(self.pin_edit.backspace)
+        keypad.addWidget(backspace_button, 3, 2)
+
+        root.addLayout(keypad, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        self.accept_button = buttons.button(QDialogButtonBox.Ok)
+        self.accept_button.setText(accept_text)
+        self.accept_button.setMinimumHeight(46)
+        cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        cancel_button.setMinimumHeight(46)
+        self.accept_button.setEnabled(False)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.pin_edit.returnPressed.connect(self._accept_if_valid)
+        self.pin_edit.setFocus()
+
+    @staticmethod
+    def _key_button(text):
+        button = QPushButton(text)
+        button.setMinimumHeight(58)
+        button.setStyleSheet("font-size: 20px; font-weight: 700;")
+        return button
+
+    def _append_digit(self, digit):
+        if len(self.pin_edit.text()) < 12:
+            self.pin_edit.insert(digit)
+
+    def _sanitize_pin(self, text):
+        clean_text = "".join(
+            character for character in text if character.isdigit()
+        )[:12]
+        if clean_text != text:
+            self.pin_edit.setText(clean_text)
+            return
+        self.accept_button.setEnabled(4 <= len(clean_text) <= 12)
+
+    def _accept_if_valid(self):
+        if self.accept_button.isEnabled():
+            self.accept()
+
+    def pin(self):
+        return self.pin_edit.text()
 
 
 class ConfigurationDialog(QDialog):
@@ -176,7 +289,7 @@ class ConfigurationDialog(QDialog):
         self.sensor_to_stop = self._double_box(
             values["sensor_to_stop_delay_sec"], 0.05, 10.0, 0.05, 2, " s"
         )
-        form.addRow("Sensor → stop delay", self.sensor_to_stop)
+        form.addRow("Sensor -> stop delay", self.sensor_to_stop)
 
         self.belt_settle = self._double_box(
             values["belt_settle_delay_sec"], 0.0, 5.0, 0.05, 2, " s"
@@ -210,9 +323,9 @@ class ConfigurationDialog(QDialog):
         content_layout.addLayout(form)
 
         hardware_summary = QLabel(
-            f"Locked hardware: Sensor GPIO {config.PROXIMITY_PIN} • "
-            f"Forward GPIO {config.FORWARD_RELAY_PIN} • "
-            f"Reverse GPIO {config.REVERSE_RELAY_PIN} • "
+            f"Locked hardware: Sensor GPIO {config.PROXIMITY_PIN} | "
+            f"Forward GPIO {config.FORWARD_RELAY_PIN} | "
+            f"Reverse GPIO {config.REVERSE_RELAY_PIN} | "
             "Relays ACTIVE LOW"
         )
         hardware_summary.setWordWrap(True)
@@ -301,7 +414,7 @@ class ConfigurationDialog(QDialog):
         raw_text = "HIGH" if raw_high else "LOW"
         state_text = "DETECTED" if detected else "CLEAR"
         self.sensor_test.setText(
-            f"Live sensor: {raw_text} → {state_text} with selected polarity"
+            f"Live sensor: {raw_text} -> {state_text} with selected polarity"
         )
         color = "#c17b16" if detected else "#1f8f62"
         self.sensor_test.setStyleSheet(
@@ -341,6 +454,7 @@ class KioskStemConveyorGUI(StemConveyorGUI):
 
         self._configure_kiosk_controls()
         self._install_developer_shortcut()
+        self._install_developer_touch_gesture()
         self._refresh_runtime_labels()
 
     # ========================================================
@@ -403,11 +517,11 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         values = self.runtime_settings
         if hasattr(self, "auto_mode_label"):
             self.auto_mode_label.setText(
-                "Auto mode: detect stem → move "
-                f"{values['sensor_to_stop_delay_sec']:.2f} s → stop belt → "
-                f"settle {values['belt_settle_delay_sec']:.2f} s → photo → "
+                "Auto mode: detect stem -> move "
+                f"{values['sensor_to_stop_delay_sec']:.2f} s -> stop belt -> "
+                f"settle {values['belt_settle_delay_sec']:.2f} s -> photo -> "
                 "restart. No detection for "
-                f"{values['no_detection_timeout_sec']:.0f} s → belt stops."
+                f"{values['no_detection_timeout_sec']:.0f} s -> belt stops."
             )
 
     # ========================================================
@@ -424,7 +538,9 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         self.btn_exit.setText("SHUT DOWN")
         self.btn_exit.setIcon(make_power_icon(28))
         self.btn_exit.setIconSize(QSize(28, 28))
-        self.btn_exit.setToolTip("Safely stop the conveyor and power off the imaging station.")
+        self.btn_exit.setToolTip(
+            "Safely stop the conveyor and power off the imaging station."
+        )
         self.btn_exit.clicked.connect(self.shutdown_system)
 
     def _install_developer_shortcut(self):
@@ -434,6 +550,84 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         )
         self.developer_shortcut.setContext(Qt.ApplicationShortcut)
         self.developer_shortcut.activated.connect(self._request_developer_access)
+
+    def _install_developer_touch_gesture(self):
+        self._developer_hold_active = False
+        self._developer_hold_ready = False
+
+        self._developer_hold_timer = QTimer(self)
+        self._developer_hold_timer.setSingleShot(True)
+        self._developer_hold_timer.setInterval(config.DEVELOPER_TOUCH_HOLD_MS)
+        self._developer_hold_timer.timeout.connect(
+            self._arm_developer_touch_access
+        )
+
+        # A touchscreen normally produces touch events, while some desktop
+        # configurations synthesize mouse events. Handle both paths.
+        self.header.setAttribute(Qt.WA_AcceptTouchEvents, True)
+        self.header.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if watched is self.header:
+            event_type = event.type()
+
+            if event_type == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.LeftButton:
+                    self._start_developer_hold()
+            elif event_type == QEvent.Type.TouchBegin:
+                self._start_developer_hold()
+                event.accept()
+                return True
+            elif event_type == QEvent.Type.TouchUpdate:
+                if self._developer_hold_active:
+                    event.accept()
+                    return True
+            elif event_type in (
+                QEvent.Type.MouseButtonRelease,
+                QEvent.Type.TouchEnd,
+            ):
+                self._finish_developer_hold()
+                if event_type == QEvent.Type.TouchEnd:
+                    event.accept()
+                    return True
+            elif event_type == QEvent.Type.TouchCancel:
+                self._cancel_developer_hold()
+                event.accept()
+                return True
+
+        return super().eventFilter(watched, event)
+
+    def _start_developer_hold(self):
+        if self._developer_hold_active:
+            return
+
+        self._developer_hold_active = True
+        self._developer_hold_ready = False
+        self._developer_hold_timer.start()
+
+    def _arm_developer_touch_access(self):
+        if not self._developer_hold_active:
+            return
+
+        self._developer_hold_ready = True
+        self._say("Release the title to open developer access.")
+
+    def _finish_developer_hold(self):
+        if not self._developer_hold_active:
+            return
+
+        open_developer_access = self._developer_hold_ready
+        self._cancel_developer_hold()
+
+        if open_developer_access:
+            # Open after the release event completes so that the same touch
+            # cannot accidentally press a control in the PIN dialog.
+            QTimer.singleShot(0, self._request_developer_access)
+
+    def _cancel_developer_hold(self):
+        self._developer_hold_timer.stop()
+        self._developer_hold_active = False
+        self._developer_hold_ready = False
 
     # ========================================================
     # SHUTDOWN
@@ -498,7 +692,8 @@ class KioskStemConveyorGUI(StemConveyorGUI):
             QMessageBox.warning(
                 self,
                 "Developer Access Locked",
-                f"Too many incorrect PIN attempts. Try again in {remaining:.0f} seconds.",
+                "Too many incorrect PIN attempts. Try again in "
+                f"{remaining:.0f} seconds.",
             )
             return
 
@@ -513,15 +708,14 @@ class KioskStemConveyorGUI(StemConveyorGUI):
             if not self._create_first_developer_pin():
                 return
 
-        pin, accepted = QInputDialog.getText(
+        pin_dialog = PinEntryDialog(
             self,
             "Developer Access",
             "Developer PIN:",
-            QLineEdit.Password,
         )
-
-        if not accepted:
+        if pin_dialog.exec() != QDialog.Accepted:
             return
+        pin = pin_dialog.pin()
 
         if not self.developer_auth.verify(pin):
             self._pin_failures += 1
@@ -559,18 +753,19 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         QMessageBox.information(
             self,
             "Create Developer PIN",
-            "No developer PIN exists yet. Create a 4–12 digit PIN now. "
+            "No developer PIN exists yet. Create a 4-12 digit PIN now. "
             "The PIN itself will not be stored; only a salted hash is saved.",
         )
 
-        first, accepted = QInputDialog.getText(
+        first_dialog = PinEntryDialog(
             self,
             "Create Developer PIN",
-            "New 4–12 digit PIN:",
-            QLineEdit.Password,
+            "New 4-12 digit PIN:",
+            "Continue",
         )
-        if not accepted:
+        if first_dialog.exec() != QDialog.Accepted:
             return False
+        first = first_dialog.pin()
 
         if not self.developer_auth.valid_pin_format(first):
             QMessageBox.warning(
@@ -580,14 +775,15 @@ class KioskStemConveyorGUI(StemConveyorGUI):
             )
             return False
 
-        second, accepted = QInputDialog.getText(
+        second_dialog = PinEntryDialog(
             self,
             "Confirm Developer PIN",
             "Enter the PIN again:",
-            QLineEdit.Password,
+            "Confirm",
         )
-        if not accepted:
+        if second_dialog.exec() != QDialog.Accepted:
             return False
+        second = second_dialog.pin()
 
         if first != second:
             QMessageBox.warning(
