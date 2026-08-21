@@ -207,6 +207,289 @@ class ExpectedSamplesDialog(QDialog):
             self.accept()
 
 
+class BatchHistoryDialog(QDialog):
+    """Browse, export, and explicitly delete finalized batch photos."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.controller = parent
+        self.storage = parent.storage
+        self.sessions = []
+        self.selected_manifest_path = None
+        self.selected_summary = None
+
+        self.setWindowTitle("Batch History")
+        self.setModal(True)
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            self.resize(
+                min(980, max(1, available.width() - 30)),
+                min(570, max(1, available.height() - 30)),
+            )
+        else:
+            self.resize(940, 560)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        title = QLabel("BATCH HISTORY")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 20px; font-weight: 800;")
+        root.addWidget(title)
+
+        content = QHBoxLayout()
+        content.setSpacing(10)
+
+        batch_column = QVBoxLayout()
+        batch_label = QLabel("Batches")
+        batch_label.setStyleSheet("font-size: 16px; font-weight: 800;")
+        self.batch_list = QListWidget()
+        self.batch_list.setMinimumWidth(285)
+        self.batch_list.currentItemChanged.connect(
+            self._on_batch_selected
+        )
+        batch_column.addWidget(batch_label)
+        batch_column.addWidget(self.batch_list, 1)
+        content.addLayout(batch_column, 2)
+
+        photo_column = QVBoxLayout()
+        photo_label = QLabel("Saved photos")
+        photo_label.setStyleSheet("font-size: 16px; font-weight: 800;")
+        self.photo_list = QListWidget()
+        self.photo_list.setMinimumWidth(270)
+        self.photo_list.currentItemChanged.connect(
+            self._on_photo_selected
+        )
+        photo_column.addWidget(photo_label)
+        photo_column.addWidget(self.photo_list, 1)
+        content.addLayout(photo_column, 2)
+
+        detail_column = QVBoxLayout()
+        self.details_label = QLabel("Select a batch.")
+        self.details_label.setWordWrap(True)
+        self.details_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.details_label.setStyleSheet(
+            "font-size: 14px; background: #eef2f7; padding: 8px;"
+        )
+        self.history_preview = QLabel("No photo selected")
+        self.history_preview.setAlignment(Qt.AlignCenter)
+        self.history_preview.setMinimumSize(280, 230)
+        self.history_preview.setStyleSheet(
+            "background: #182033; color: #dce6ff; border-radius: 8px;"
+        )
+        detail_column.addWidget(self.details_label)
+        detail_column.addWidget(self.history_preview, 1)
+        content.addLayout(detail_column, 3)
+        root.addLayout(content, 1)
+
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        self.refresh_button = QPushButton("REFRESH")
+        self.export_button = QPushButton("SAVE BATCH TO USB")
+        self.delete_button = QPushButton("DELETE SELECTED PHOTO")
+        close_button = QPushButton("CLOSE")
+        for button in (
+            self.refresh_button,
+            self.export_button,
+            self.delete_button,
+            close_button,
+        ):
+            button.setMinimumHeight(48)
+            button.setAutoDefault(False)
+            button.setFocusPolicy(Qt.NoFocus)
+            actions.addWidget(button)
+        close_button.setDefault(True)
+        self.refresh_button.clicked.connect(self.refresh_sessions)
+        self.export_button.clicked.connect(self._export_selected_batch)
+        self.delete_button.clicked.connect(self._delete_selected_photo)
+        close_button.clicked.connect(self.accept)
+        root.addLayout(actions)
+
+        self.refresh_sessions()
+
+    def refresh_sessions(self):
+        preserve = self.selected_manifest_path
+        self.sessions = self.storage.list_sessions()
+        self.batch_list.clear()
+
+        selected_row = 0
+        for row, summary in enumerate(self.sessions):
+            created = str(summary.get("created_at") or "").replace("T", " ")
+            created = created[:19] or "Unknown date"
+            status = str(summary.get("status") or "unknown").upper()
+            barcode = summary.get("barcode") or "Unknown barcode"
+            count = int(summary.get("actual_count") or 0)
+            item = QListWidgetItem(
+                f"{barcode}\n{created} • {status} • {count} photos"
+            )
+            item.setData(
+                Qt.UserRole,
+                str(summary.get("manifest_path") or ""),
+            )
+            self.batch_list.addItem(item)
+            if preserve and Path(item.data(Qt.UserRole)) == Path(preserve):
+                selected_row = row
+
+        if self.sessions:
+            self.batch_list.setCurrentRow(selected_row)
+        else:
+            self.selected_manifest_path = None
+            self.selected_summary = None
+            self.photo_list.clear()
+            self.details_label.setText("No stored batches were found.")
+            self.history_preview.setText("No photo selected")
+            self.export_button.setEnabled(False)
+            self.delete_button.setEnabled(False)
+
+    def _on_batch_selected(self, current, _previous):
+        self.photo_list.clear()
+        self.history_preview.clear()
+        self.history_preview.setText("No photo selected")
+        self.delete_button.setEnabled(False)
+        self.export_button.setEnabled(False)
+        self.selected_summary = None
+        self.selected_manifest_path = None
+        if current is None:
+            return
+
+        manifest_path = Path(current.data(Qt.UserRole))
+        summary = next(
+            (
+                item
+                for item in self.sessions
+                if Path(item.get("manifest_path")) == manifest_path
+            ),
+            None,
+        )
+        if summary is None:
+            return
+
+        self.selected_summary = summary
+        self.selected_manifest_path = manifest_path
+        if summary.get("error"):
+            self.details_label.setText(
+                f"This batch cannot be read.\n\n{summary['error']}"
+            )
+            return
+
+        try:
+            self.storage.get_session_images(manifest_path)
+        except StorageError as error:
+            self.details_label.setText(str(error))
+            return
+
+        for number, image_path in enumerate(images, start=1):
+            item = QListWidgetItem(f"{number}. {image_path.name}")
+            item.setData(Qt.UserRole, str(image_path))
+            self.photo_list.addItem(item)
+
+        expected = int(summary.get("expected_count") or 0)
+        expected_text = str(expected) if expected > 0 else "Not set"
+        exported = summary.get("last_verified_export_at")
+        if exported:
+            export_text = str(exported).replace("T", " ")[:19]
+            if summary.get("export_needs_refresh"):
+                export_text += " (OUTDATED — export again)"
+        else:
+            export_text = "Not yet exported"
+        self.details_label.setText(
+            f"Barcode: {summary.get('barcode')}\n"
+            f"Status: {str(summary.get('status')).upper()}\n"
+            f"Session: {summary.get('session_id')}\n"
+            f"Saved photos: {len(images)}\n"
+            f"Expected: {expected_text}\n"
+            f"Verified USB export: {export_text}"
+        )
+        # Manifest-only export is allowed so a re-export can remove USB files
+        # that were later deleted from the finalized local batch.
+        self.export_button.setEnabled(True)
+
+    def _on_photo_selected(self, current, _previous):
+        self.delete_button.setEnabled(False)
+        if current is None or self.selected_summary is None:
+            self.history_preview.clear()
+            self.history_preview.setText("No photo selected")
+            return
+
+        image_path = Path(current.data(Qt.UserRole))
+        pixmap = QPixmap(str(image_path))
+        if pixmap.isNull():
+            self.history_preview.clear()
+            self.history_preview.setText("Photo could not be opened")
+        else:
+            self.history_preview.setPixmap(
+                pixmap.scaled(
+                    self.history_preview.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            )
+
+        self.delete_button.setEnabled(
+            self.selected_summary.get("status") in {"completed", "cancelled"}
+        )
+
+    def _export_selected_batch(self):
+        if self.selected_manifest_path is None:
+            return
+        if self.controller.start_usb_export_for_manifest(
+            self.selected_manifest_path
+        ):
+            self.accept()
+
+    def _delete_selected_photo(self):
+        current = self.photo_list.currentItem()
+        if (
+            current is None
+            or self.selected_manifest_path is None
+            or self.selected_summary is None
+        ):
+            return
+
+        image_path = Path(current.data(Qt.UserRole))
+        barcode = self.selected_summary.get("barcode")
+        export_warning = (
+            "\n\nA previous USB copy will not be changed. This batch will "
+            "be marked as needing another export."
+            if self.selected_summary.get("last_verified_export_at")
+            else ""
+        )
+        reply = QMessageBox.question(
+            self,
+            "Permanently Delete Historical Photo?",
+            f"Barcode: {barcode}\n"
+            f"Photo: {image_path.name}\n\n"
+            "This permanently deletes the local image and records the "
+            "deletion in the finalized batch manifest. This cannot be "
+            f"undone.{export_warning}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            remaining = self.storage.delete_historical_image(
+                self.selected_manifest_path,
+                image_path,
+            )
+        except StorageError as error:
+            QMessageBox.critical(
+                self,
+                "Historical Photo Deletion Failed",
+                str(error),
+            )
+            return
+
+        self.controller._say(
+            f"Historical photo deleted. Batch {barcode} now has "
+            f"{remaining} saved photos."
+        )
+        self.refresh_sessions()
+
+
 class StemConveyorGUI(QWidget):
     """
     Touch-friendly conveyor imaging interface.
@@ -268,6 +551,7 @@ class StemConveyorGUI(QWidget):
         self.last_scan_at = 0.0
         self.usb_export_in_progress = False
         self.usb_export_process = None
+        self.usb_export_manifest_path = None
 
         # ====================================================
         # SYSTEM STATE
@@ -507,6 +791,10 @@ class StemConveyorGUI(QWidget):
         self.btn_next = QPushButton("Next ▶")
         self.btn_copy_current = QPushButton("Save This to USB")
         self.btn_copy_all = QPushButton("Save Batch to USB")
+        self.btn_batch_history = QPushButton("BATCH HISTORY")
+        self.btn_batch_history.setToolTip(
+            "Browse, export, or delete photos from previous batches."
+        )
         self.btn_delete = QPushButton("Delete Photo")
         self.btn_exit = QPushButton("Exit")
 
@@ -551,6 +839,7 @@ class StemConveyorGUI(QWidget):
         self.btn_next.clicked.connect(self.next_image)
         self.btn_copy_current.clicked.connect(self.copy_current_to_usb)
         self.btn_copy_all.clicked.connect(self.copy_all_to_usb)
+        self.btn_batch_history.clicked.connect(self.open_batch_history)
         self.btn_delete.clicked.connect(self.delete_current_image)
         self.btn_exit.clicked.connect(self.close)
         self.image_list.itemClicked.connect(self.select_image_from_list)
@@ -602,6 +891,7 @@ class StemConveyorGUI(QWidget):
             self.btn_next,
             self.btn_copy_current,
             self.btn_copy_all,
+            self.btn_batch_history,
             self.btn_delete,
             self.btn_exit,
         ):
@@ -668,6 +958,8 @@ class StemConveyorGUI(QWidget):
         photo_title.setObjectName("photoPageTitle")
         photo_header.addWidget(photo_title)
         photo_header.addStretch(1)
+        self.btn_batch_history.setMinimumSize(170, 42)
+        photo_header.addWidget(self.btn_batch_history)
         self.btn_back_to_main.setMinimumSize(190, 42)
         photo_header.addWidget(self.btn_back_to_main)
         photo_page_layout.addLayout(photo_header)
@@ -780,6 +1072,28 @@ class StemConveyorGUI(QWidget):
         self.compact_stack.setCurrentWidget(self.control_page)
         self.btn_open_photos.setEnabled(True)
         self.show_current_image()
+
+    def open_batch_history(self):
+        if self.usb_export_in_progress:
+            self._say("Wait for the USB export to finish.")
+            return
+        if (
+            self.conveyor_running
+            or self.capture_cycle_in_progress
+            or self.direction_change_in_progress
+            or self.reset_in_progress
+        ):
+            self._say(
+                "Pause the belt and wait for the current operation before "
+                "opening Batch History."
+            )
+            return
+
+        dialog = BatchHistoryDialog(self)
+        dialog.exec()
+        self.refresh_image_list()
+        self.update_status_display()
+        QTimer.singleShot(0, self._focus_barcode_input)
 
     def _make_status_card(self, layout, title, value):
         card = QFrame()
@@ -2695,20 +3009,33 @@ class StemConveyorGUI(QWidget):
         self._say(f"Saved {image_path.name} to USB.")
 
     def copy_all_to_usb(self):
+        try:
+            manifest_path = self.storage._manifest_path()
+        except StorageError as error:
+            self._say(str(error))
+            return
+        self.start_usb_export_for_manifest(manifest_path)
+
+    def start_usb_export_for_manifest(self, manifest_path):
         if self.usb_export_in_progress:
             self._say("A USB export is already in progress.")
-            return
+            return False
         if self.conveyor_running or self.capture_cycle_in_progress:
             self._say("Pause the belt before saving the batch to USB.")
-            return
+            return False
 
-        if not self.image_files:
-            QMessageBox.information(
-                self,
-                "No Photos",
-                "There are no photos to copy.",
+        try:
+            manifest_path, manifest = self.storage.load_session_manifest(
+                manifest_path
             )
-            return
+            self.storage.get_session_images(manifest_path)
+        except StorageError as error:
+            QMessageBox.warning(
+                self,
+                "Batch Cannot Be Exported",
+                str(error),
+            )
+            return False
 
         usb_mount = self.storage.find_usb_mount()
         if usb_mount is None:
@@ -2717,7 +3044,7 @@ class StemConveyorGUI(QWidget):
                 "USB Not Found",
                 "Insert a USB drive and try again.",
             )
-            return
+            return False
 
         process = QProcess(self)
         process.setProcessChannelMode(QProcess.MergedChannels)
@@ -2727,18 +3054,21 @@ class StemConveyorGUI(QWidget):
         process.setArguments(
             [
                 str(Path(__file__).with_name("usb_export_worker.py")),
-                str(self.storage._manifest_path()),
+                str(manifest_path),
                 str(usb_mount),
             ]
         )
         self.usb_export_process = process
+        self.usb_export_manifest_path = manifest_path
         self.usb_export_in_progress = True
         self._say(
-            "Saving and verifying the batch on USB. Keep the drive inserted..."
+            f"Saving and verifying batch {manifest.get('barcode')} on USB. "
+            "Keep the drive inserted..."
         )
         self._refresh_batch_ui()
         self.update_status_display()
         process.start()
+        return True
 
     def _on_usb_export_process_error(self, _process_error):
         process = self.usb_export_process
@@ -2768,12 +3098,15 @@ class StemConveyorGUI(QWidget):
 
         if exit_code == 0 and result and result.get("success"):
             copied = int(result.get("copied") or 0)
+            destination = result.get("destination")
             self._finish_usb_export(
                 success=True,
                 message=(
                     f"Saved and verified {copied} batch photos plus manifest "
                     "on USB."
                 ),
+                copied=copied,
+                destination=destination,
             )
             return
 
@@ -2784,17 +3117,52 @@ class StemConveyorGUI(QWidget):
             details = output
         self._finish_usb_export(success=False, message=details)
 
-    def _finish_usb_export(self, success, message):
+    def _finish_usb_export(
+        self,
+        success,
+        message,
+        copied=0,
+        destination=None,
+    ):
         process = self.usb_export_process
+        manifest_path = self.usb_export_manifest_path
         self.usb_export_process = None
+        self.usb_export_manifest_path = None
         self.usb_export_in_progress = False
         if process is not None:
             process.deleteLater()
+
+        audit_failure = False
+        if success:
+            try:
+                self.storage.record_verified_usb_export(
+                    manifest_path,
+                    destination,
+                    copied,
+                )
+            except Exception as error:
+                success = False
+                audit_failure = True
+                message = (
+                    "The image copies verified, but the final manifest/export "
+                    f"audit could not be synchronized: {error}"
+                )
 
         self._refresh_batch_ui()
         self.update_status_display()
         if success:
             self._say(message)
+        elif audit_failure:
+            self._say(
+                "USB image copies completed, but export verification records "
+                "need attention."
+            )
+            QMessageBox.warning(
+                self,
+                "USB Export Incomplete",
+                f"{message}\n\nKeep the Raspberry Pi images and repeat the "
+                "batch export after resolving the problem.",
+            )
         else:
             self._say("USB export failed. Raspberry Pi images are unchanged.")
             QMessageBox.warning(
@@ -2983,6 +3351,7 @@ class StemConveyorGUI(QWidget):
         self.btn_copy_all.setEnabled(
             storage_action_ready and bool(self.image_files)
         )
+        self.btn_batch_history.setEnabled(storage_action_ready)
         self.btn_delete.setEnabled(
             storage_action_ready
             and bool(self.image_files)
