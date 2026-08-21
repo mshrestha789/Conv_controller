@@ -32,6 +32,7 @@ from config import (
     SENSOR_TO_STOP_DELAY_SEC,
     BELT_SETTLE_DELAY_SEC,
     POST_CAPTURE_DELAY_SEC,
+    BATCH_COMPLETION_RUNOUT_DELAY_SEC,
     AUTO_CAPTURE_FORWARD,
     AUTO_CAPTURE_REVERSE,
     SENSOR_POLL_MS,
@@ -516,6 +517,7 @@ class StemConveyorGUI(QWidget):
     STAGE_SETTLING = "settling"
     STAGE_CAPTURING = "capturing"
     STAGE_RESTARTING = "restarting"
+    STAGE_BATCH_RUNOUT = "batch_runout"
 
     def __init__(self):
         super().__init__()
@@ -678,6 +680,11 @@ class StemConveyorGUI(QWidget):
         self.restart_timer = QTimer(self)
         self.restart_timer.setSingleShot(True)
         self.restart_timer.timeout.connect(self.restart_after_capture_cycle)
+
+        # Final expected photo -> move the last sample clear -> stop.
+        self.batch_runout_timer = QTimer(self)
+        self.batch_runout_timer.setSingleShot(True)
+        self.batch_runout_timer.timeout.connect(self.finish_batch_runout)
 
         self.update_status_display()
         self._update_direction_button()
@@ -2041,6 +2048,7 @@ class StemConveyorGUI(QWidget):
         self.travel_timer.stop()
         self.settle_timer.stop()
         self.restart_timer.stop()
+        self.batch_runout_timer.stop()
 
         # Clear the imaging state without calling camera.cancel_capture();
         # camera.reset() itself owns termination/recreation of the worker.
@@ -2587,18 +2595,7 @@ class StemConveyorGUI(QWidget):
         )
 
         if expected_reached:
-            # The belt is already stopped for the photo. Do not restart after
-            # the declared number of samples; the operator still explicitly
-            # reviews and completes the batch.
-            self.system_running = False
-            self.conveyor_running = False
-            self.capture_cycle_in_progress = False
-            self.capture_stage = self.STAGE_IDLE
-            self.restart_after_capture = False
-            self._say(
-                f"Expected count {expected} reached. Belt remains stopped. "
-                "Review the count, then press COMPLETE BATCH."
-            )
+            self._start_batch_completion_runout(expected)
 
         elif self.restart_after_capture and self.system_running:
             self.capture_stage = self.STAGE_RESTARTING
@@ -2613,6 +2610,100 @@ class StemConveyorGUI(QWidget):
             self.restart_after_capture = False
             self._say("Photo saved. Belt remains stopped.")
 
+        self.update_status_display()
+
+    def _start_batch_completion_runout(self, expected):
+        """Move an automatically captured final sample clear, then stop.
+
+        The image and manifest entry are already durable before this runs.
+        A capture initiated while the conveyor was stopped must never cause
+        unexpected motion, even when the expected count is reached.
+        """
+        should_run = (
+            self.restart_after_capture
+            and self.system_running
+            and BATCH_COMPLETION_RUNOUT_DELAY_SEC > 0
+        )
+
+        self.restart_after_capture = False
+        self.no_detection_since = None
+
+        if not should_run:
+            self.system_running = False
+            self.conveyor_running = False
+            self.capture_cycle_in_progress = False
+            self.capture_stage = self.STAGE_IDLE
+            self._say(
+                f"Expected count {expected} reached. Belt remains stopped. "
+                "Review the count, then press COMPLETE BATCH."
+            )
+            return
+
+        started = self.hardware.conveyor_start(self.selected_direction)
+        if not started:
+            self.system_running = False
+            self.conveyor_running = False
+            self.capture_cycle_in_progress = False
+            self.capture_stage = self.STAGE_IDLE
+            self._say(
+                f"Expected count {expected} reached, but final runout could "
+                "not start. Belt remains stopped."
+            )
+            QMessageBox.warning(
+                self,
+                "Final Runout Could Not Start",
+                "The last photo was saved, but the conveyor start command "
+                "was refused. The belt remains OFF.\n\n"
+                "Move the final sample manually if needed, review the count, "
+                "then press COMPLETE BATCH.",
+            )
+            return
+
+        # Disable normal sensor-triggered imaging during this bounded motion.
+        # STOP / RESET / faults / shutdown still cancel the timer and stop the
+        # relay immediately.
+        self.system_running = False
+        self.conveyor_running = True
+        self.capture_cycle_in_progress = True
+        self.capture_stage = self.STAGE_BATCH_RUNOUT
+        self.sensor_active_since = None
+        delay_ms = max(
+            1,
+            int(BATCH_COMPLETION_RUNOUT_DELAY_SEC * 1000),
+        )
+        self.batch_runout_timer.start(delay_ms)
+        self._say(
+            f"Expected count {expected} reached. Final photo saved. Moving "
+            f"the last sample clear for "
+            f"{BATCH_COMPLETION_RUNOUT_DELAY_SEC:.1f} seconds..."
+        )
+
+    def finish_batch_runout(self):
+        """Stop after the bounded final-sample clearing movement."""
+        if self.capture_stage != self.STAGE_BATCH_RUNOUT:
+            return
+
+        try:
+            self.hardware.conveyor_stop()
+        except Exception:
+            pass
+
+        self.system_running = False
+        self.conveyor_running = False
+        self.capture_cycle_in_progress = False
+        self.capture_stage = self.STAGE_IDLE
+        self.capture_source = "auto"
+        self.restart_after_capture = False
+        self.sensor_active_since = None
+        self.no_detection_since = None
+
+        expected = int(
+            self.storage.active_manifest.get("expected_count") or 0
+        ) if self.storage.active_manifest is not None else 0
+        self._say(
+            f"Expected count {expected} reached. Final runout complete; belt "
+            "stopped. Review the count, then press COMPLETE BATCH."
+        )
         self.update_status_display()
 
     def _handle_camera_failure(self, message):
@@ -2710,6 +2801,7 @@ class StemConveyorGUI(QWidget):
         self.travel_timer.stop()
         self.settle_timer.stop()
         self.restart_timer.stop()
+        self.batch_runout_timer.stop()
 
         self.camera.cancel_capture()
 
@@ -3209,6 +3301,7 @@ class StemConveyorGUI(QWidget):
                 self.STAGE_SETTLING: "SETTLING",
                 self.STAGE_CAPTURING: "TAKING PHOTO",
                 self.STAGE_RESTARTING: "RESTARTING",
+                self.STAGE_BATCH_RUNOUT: "FINAL RUNOUT",
             }.get(self.capture_stage, "BUSY")
 
             self.system_value.setText(stage_text)

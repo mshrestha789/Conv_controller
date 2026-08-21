@@ -301,6 +301,23 @@ class ConfigurationDialog(QDialog):
         )
         form.addRow("Post-photo restart delay", self.post_capture)
 
+        self.batch_completion_runout = self._double_box(
+            values["batch_completion_runout_delay_sec"],
+            0.0,
+            5.0,
+            0.1,
+            1,
+            " s",
+        )
+        self.batch_completion_runout.setToolTip(
+            "After the final expected photo, run the belt this long to move "
+            "the last sample clear. Set 0 for an immediate stop."
+        )
+        form.addRow(
+            "Final-sample belt runout",
+            self.batch_completion_runout,
+        )
+
         self.direction_dead_time = QSpinBox()
         self.direction_dead_time.setRange(100, 5000)
         self.direction_dead_time.setSingleStep(100)
@@ -387,6 +404,9 @@ class ConfigurationDialog(QDialog):
         self.sensor_to_stop.setValue(defaults["sensor_to_stop_delay_sec"])
         self.belt_settle.setValue(defaults["belt_settle_delay_sec"])
         self.post_capture.setValue(defaults["post_capture_delay_sec"])
+        self.batch_completion_runout.setValue(
+            defaults["batch_completion_runout_delay_sec"]
+        )
         self.direction_dead_time.setValue(
             defaults["direction_change_dead_time_ms"]
         )
@@ -430,6 +450,9 @@ class ConfigurationDialog(QDialog):
             "sensor_to_stop_delay_sec": self.sensor_to_stop.value(),
             "belt_settle_delay_sec": self.belt_settle.value(),
             "post_capture_delay_sec": self.post_capture.value(),
+            "batch_completion_runout_delay_sec": (
+                self.batch_completion_runout.value()
+            ),
             "direction_change_dead_time_ms": self.direction_dead_time.value(),
             "camera_capture_timeout_sec": self.camera_timeout.value(),
         }
@@ -468,6 +491,9 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         ]
         gui_module.BELT_SETTLE_DELAY_SEC = values["belt_settle_delay_sec"]
         gui_module.POST_CAPTURE_DELAY_SEC = values["post_capture_delay_sec"]
+        gui_module.BATCH_COMPLETION_RUNOUT_DELAY_SEC = values[
+            "batch_completion_runout_delay_sec"
+        ]
         gui_module.SENSOR_STUCK_ACTIVE_TIMEOUT_SEC = values[
             "sensor_stuck_active_timeout_sec"
         ]
@@ -520,7 +546,9 @@ class KioskStemConveyorGUI(StemConveyorGUI):
                 "Auto mode: detect stem -> move "
                 f"{values['sensor_to_stop_delay_sec']:.2f} s -> stop belt -> "
                 f"settle {values['belt_settle_delay_sec']:.2f} s -> photo -> "
-                "restart. No detection for "
+                "restart. After the final expected photo, run "
+                f"{values['batch_completion_runout_delay_sec']:.1f} s -> "
+                "stop. No detection for "
                 f"{values['no_detection_timeout_sec']:.0f} s -> belt stops."
             )
 

@@ -82,6 +82,10 @@ DIRECTION_CHANGE_DEAD_TIME_MS = 800
 SENSOR_TO_STOP_DELAY_SEC = 1.7
 BELT_SETTLE_DELAY_SEC = 0.2
 POST_CAPTURE_DELAY_SEC = 0.1
+# After the final expected image is safely recorded, briefly run the belt to
+# carry that sample clear of the camera. Set to 0.0 to keep the old immediate
+# stop behavior.
+BATCH_COMPLETION_RUNOUT_DELAY_SEC = 1.5
 
 AUTO_CAPTURE_FORWARD = True
 AUTO_CAPTURE_REVERSE = False
