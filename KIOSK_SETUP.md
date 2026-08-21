@@ -42,6 +42,7 @@ Stored in `~/stem_conveyor/settings.json`:
 - sensor-to-stop delay
 - belt-settle delay
 - post-photo restart delay
+- final-sample belt runout (0-5 seconds; 0 disables it)
 - direction-change dead time
 - camera capture timeout
 

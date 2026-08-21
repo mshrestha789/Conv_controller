@@ -25,6 +25,9 @@ class RuntimeSettings:
             "sensor_to_stop_delay_sec": float(config.SENSOR_TO_STOP_DELAY_SEC),
             "belt_settle_delay_sec": float(config.BELT_SETTLE_DELAY_SEC),
             "post_capture_delay_sec": float(config.POST_CAPTURE_DELAY_SEC),
+            "batch_completion_runout_delay_sec": float(
+                config.BATCH_COMPLETION_RUNOUT_DELAY_SEC
+            ),
             "direction_change_dead_time_ms": int(
                 config.DIRECTION_CHANGE_DEAD_TIME_MS
             ),
@@ -83,6 +86,9 @@ class RuntimeSettings:
             ),
             "post_capture_delay_sec": clamp_float(
                 "post_capture_delay_sec", 0.0, 5.0
+            ),
+            "batch_completion_runout_delay_sec": clamp_float(
+                "batch_completion_runout_delay_sec", 0.0, 5.0
             ),
             "direction_change_dead_time_ms": clamp_int(
                 "direction_change_dead_time_ms", 100, 5000

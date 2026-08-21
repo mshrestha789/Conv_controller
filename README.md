@@ -33,8 +33,12 @@ this application. Insulate them separately so they cannot short accidentally.
 
 When an expected total is set, its button shows live progress such as
 `23 / 50`. The button is disabled until a barcode batch exists and while the
-belt is moving. Reaching the expected total keeps the belt stopped, but the
-operator must still confirm **COMPLETE BATCH**.
+belt is moving. After the final expected photo is safely saved, the belt runs
+for the configured final-sample runout time (1.5 seconds by default) to carry
+that sample clear, then stops. The operator must still review the count and
+confirm **COMPLETE BATCH**. **STOP / PAUSE**, **RESET SYSTEM**, a fault, and
+shutdown always cancel the runout and stop immediately. A manual photo taken
+while the belt was already stopped never starts it.
 
 The batch locks after the first valid scan. Rapid duplicate scans and all
 later scans—whether the same or a different code—are ignored until the operator
@@ -123,6 +127,7 @@ NO_DETECTION_TIMEOUT_SEC = 30.0
 SENSOR_TO_STOP_DELAY_SEC = 1.7
 BELT_SETTLE_DELAY_SEC = 0.2
 POST_CAPTURE_DELAY_SEC = 0.1
+BATCH_COMPLETION_RUNOUT_DELAY_SEC = 1.5
 
 CAMERA_TYPE = "picamera2"
 PICAMERA_STILL_SIZE = (4624, 3472)
@@ -165,11 +170,13 @@ Capture using already-initialized camera worker
     ↓
 Photo succeeds? ───────────── No / timeout
     ↓                           ↓
-Wait POST_CAPTURE_DELAY_SEC    BELT STAYS OFF
+Final expected photo?          BELT STAYS OFF
+    ↓ No                 ↓ Yes  ↓
+Wait/restart belt        Run final-sample delay
     ↓                           ↓
-Restart belt                   RESET SYSTEM required
-    ↓
-Start a fresh no-detection timer
+Continue batch            BELT STOPS
+                                ↓
+                         COMPLETE BATCH
 ```
 
 The workflow assumes **one stem at a time between the proximity sensor and camera**.
