@@ -135,6 +135,45 @@ class StorageManager:
             raise StorageError("No batch session is selected.")
         return self.current_session_dir / self.MANIFEST_NAME
 
+    def _resolve_manifest_path(self, manifest_path):
+        manifest_path = Path(manifest_path).expanduser().resolve()
+        image_root = self.image_dir.resolve()
+        if (
+            manifest_path.name != self.MANIFEST_NAME
+            or image_root not in manifest_path.parents
+        ):
+            raise StorageError("The batch manifest path is unsafe.")
+        return manifest_path
+
+    def load_session_manifest(self, manifest_path):
+        manifest_path = self._resolve_manifest_path(manifest_path)
+        try:
+            manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as error:
+            raise StorageError(
+                f"The batch manifest could not be read: {error}"
+            ) from error
+
+        if not isinstance(manifest, dict):
+            raise StorageError("The batch manifest has an invalid format.")
+        if manifest.get("session_id") != manifest_path.parent.name:
+            raise StorageError(
+                "The manifest session ID does not match its folder."
+            )
+        if manifest.get("safe_barcode_folder") != manifest_path.parent.parent.name:
+            raise StorageError(
+                "The manifest barcode folder does not match its location."
+            )
+        self._validate_session_integrity(manifest_path, manifest)
+        return manifest_path, manifest
+
+    @staticmethod
+    def _mark_export_stale(manifest):
+        if manifest.get("last_verified_export_at"):
+            manifest["export_needs_refresh"] = True
+
     def _save_current_manifest(self):
         if self.current_manifest is None:
             raise StorageError("No batch manifest is loaded.")
@@ -195,7 +234,7 @@ class StorageManager:
                 self._clear_active_pointer()
                 return
 
-            self._validate_active_session(manifest_path, manifest)
+            self._validate_session_integrity(manifest_path, manifest)
 
             self.current_session_dir = manifest_path.parent
             self.current_manifest = manifest
@@ -209,8 +248,8 @@ class StorageManager:
             )
 
     @staticmethod
-    def _validate_active_session(manifest_path, manifest):
-        """Refuse automatic recovery when disk and manifest disagree."""
+    def _validate_session_integrity(manifest_path, manifest):
+        """Refuse use of a session when disk and manifest disagree."""
         session_dir = manifest_path.parent
         required = {
             "actual_count",
@@ -307,7 +346,7 @@ class StorageManager:
                 "Scan a batch barcode before starting the conveyor."
             )
         if require_active:
-            self._validate_active_session(
+            self._validate_session_integrity(
                 self._manifest_path(),
                 self.current_manifest,
             )
@@ -380,6 +419,10 @@ class StorageManager:
             "expected_count": expected,
             "actual_count": 0,
             "next_sequence": 1,
+            "last_verified_export_at": None,
+            "last_verified_export_destination": None,
+            "last_verified_export_count": 0,
+            "export_needs_refresh": False,
             "images": [],
             "events": [
                 {
@@ -415,6 +458,7 @@ class StorageManager:
             )
 
         self.current_manifest["expected_count"] = expected
+        self._mark_export_stale(self.current_manifest)
         self.current_manifest["updated_at"] = utc_now_text()
         self._save_current_manifest()
         self._write_active_pointer()
@@ -423,7 +467,7 @@ class StorageManager:
         if self.active_manifest is None:
             raise StorageError("There is no active batch to complete.")
 
-        self._validate_active_session(
+        self._validate_session_integrity(
             self._manifest_path(),
             self.current_manifest,
         )
@@ -445,6 +489,7 @@ class StorageManager:
                 ),
             }
         )
+        self._mark_export_stale(self.current_manifest)
         self.current_manifest["events"].append(
             {
                 "type": "batch_completed",
@@ -461,7 +506,7 @@ class StorageManager:
         if self.active_manifest is None:
             raise StorageError("There is no active batch to cancel.")
 
-        self._validate_active_session(
+        self._validate_session_integrity(
             self._manifest_path(),
             self.current_manifest,
         )
@@ -477,6 +522,7 @@ class StorageManager:
                 "cancellation_reason": str(reason),
             }
         )
+        self._mark_export_stale(self.current_manifest)
         self.current_manifest["events"].append(
             {
                 "type": "batch_cancelled",
@@ -554,6 +600,7 @@ class StorageManager:
             self.current_photo_count()
         )
         self.current_manifest["updated_at"] = now
+        self._mark_export_stale(self.current_manifest)
         self._save_current_manifest()
         self._write_active_pointer()
         return sequence
@@ -608,6 +655,7 @@ class StorageManager:
                 or expected == self.current_manifest["actual_count"]
             )
             self.current_manifest["updated_at"] = now
+            self._mark_export_stale(self.current_manifest)
             self.current_manifest["events"].append(
                 {
                     "type": "image_deleted",
@@ -624,6 +672,240 @@ class StorageManager:
             raise StorageError(
                 f"The photo deletion could not be committed safely: {error}"
             ) from error
+
+    # ========================================================
+    # BATCH HISTORY
+    # ========================================================
+
+    def list_sessions(self):
+        """Return newest-first batch summaries without changing active state."""
+        sessions = []
+        for manifest_path in self.image_dir.rglob(self.MANIFEST_NAME):
+            try:
+                safe_path, manifest = self.load_session_manifest(manifest_path)
+                sessions.append(
+                    {
+                        "manifest_path": safe_path,
+                        "barcode": str(manifest.get("barcode") or ""),
+                        "session_id": str(manifest.get("session_id") or ""),
+                        "status": str(manifest.get("status") or "unknown"),
+                        "created_at": str(manifest.get("created_at") or ""),
+                        "completed_at": manifest.get("completed_at"),
+                        "cancelled_at": manifest.get("cancelled_at"),
+                        "expected_count": int(
+                            manifest.get("expected_count") or 0
+                        ),
+                        "actual_count": len(
+                            self.get_session_images(safe_path)
+                        ),
+                        "last_verified_export_at": manifest.get(
+                            "last_verified_export_at"
+                        ),
+                        "export_needs_refresh": bool(
+                            manifest.get("export_needs_refresh")
+                        ),
+                        "error": "",
+                    }
+                )
+            except Exception as error:
+                sessions.append(
+                    {
+                        "manifest_path": Path(manifest_path),
+                        "barcode": "UNREADABLE BATCH",
+                        "session_id": Path(manifest_path).parent.name,
+                        "status": "error",
+                        "created_at": "",
+                        "completed_at": None,
+                        "cancelled_at": None,
+                        "expected_count": 0,
+                        "actual_count": 0,
+                        "last_verified_export_at": None,
+                        "export_needs_refresh": False,
+                        "error": str(error),
+                    }
+                )
+
+        sessions.sort(
+            key=lambda item: (
+                item.get("created_at") or "",
+                item.get("session_id") or "",
+            ),
+            reverse=True,
+        )
+        return sessions
+
+    def get_session_images(self, manifest_path):
+        manifest_path, manifest = self.load_session_manifest(manifest_path)
+        session_dir = manifest_path.parent
+        images = []
+        for item in manifest.get("images", []):
+            if not isinstance(item, dict) or item.get("status") != "saved":
+                continue
+            filename = str(item.get("filename") or "")
+            if not filename or Path(filename).name != filename:
+                raise StorageError(
+                    "The manifest contains an unsafe image filename."
+                )
+            path = session_dir / filename
+            if path.is_file() and path.stat().st_size > 0:
+                images.append(path)
+        return images
+
+    def delete_historical_image(self, manifest_path, image_path):
+        """Permanently remove one finalized image and retain an audit event."""
+        manifest_path, manifest = self.load_session_manifest(manifest_path)
+        if manifest.get("status") == "active":
+            raise StorageError(
+                "Active-batch photos cannot be deleted from Batch History."
+            )
+        if manifest.get("status") not in {"completed", "cancelled"}:
+            raise StorageError(
+                "Only completed or cancelled batches can be edited here."
+            )
+
+        image_path = Path(image_path).resolve()
+        if image_path.parent != manifest_path.parent:
+            raise StorageError("The selected image is outside this batch.")
+
+        record = next(
+            (
+                item
+                for item in manifest.get("images", [])
+                if isinstance(item, dict)
+                and item.get("filename") == image_path.name
+                and item.get("status") == "saved"
+            ),
+            None,
+        )
+        if record is None:
+            raise StorageError(
+                "The selected saved image is not in this manifest."
+            )
+
+        deletion_temp = image_path.with_name(
+            f".{image_path.name}.delete_{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            os.replace(image_path, deletion_temp)
+        except OSError as error:
+            raise StorageError(
+                f"The image file could not be prepared for deletion: {error}"
+            ) from error
+
+        now = utc_now_text()
+        record["status"] = "deleted"
+        record["deleted_at"] = now
+        record["deletion_source"] = "batch_history"
+        remaining = sum(
+            1
+            for item in manifest.get("images", [])
+            if isinstance(item, dict) and item.get("status") == "saved"
+        )
+        expected = int(manifest.get("expected_count") or 0)
+        manifest["actual_count"] = remaining
+        manifest["count_matches_expected"] = (
+            expected == 0 or expected == remaining
+        )
+        manifest["updated_at"] = now
+        self._mark_export_stale(manifest)
+        manifest.setdefault("events", []).append(
+            {
+                "type": "historical_image_deleted",
+                "at": now,
+                "filename": image_path.name,
+                "remaining_count": remaining,
+            }
+        )
+
+        try:
+            self._atomic_write_json(manifest_path, manifest)
+        except Exception as error:
+            try:
+                os.replace(deletion_temp, image_path)
+            except OSError as restore_error:
+                raise StorageError(
+                    "The manifest update failed and the image could not be "
+                    "restored automatically. Developer inspection is "
+                    f"required: {restore_error}"
+                ) from error
+            raise StorageError(
+                f"The deletion was cancelled because its audit update failed: {error}"
+            ) from error
+
+        try:
+            deletion_temp.unlink()
+        except OSError as error:
+            raise StorageError(
+                "The photo is marked deleted, but its temporary file could "
+                f"not be removed. Developer cleanup is required: {error}"
+            ) from error
+
+        if (
+            self.current_session_dir is not None
+            and manifest_path.parent.resolve()
+            == self.current_session_dir.resolve()
+        ):
+            self.current_manifest = manifest
+        return remaining
+
+    def record_verified_usb_export(
+        self,
+        manifest_path,
+        destination,
+        copied_count,
+    ):
+        manifest_path, manifest = self.load_session_manifest(manifest_path)
+        now = utc_now_text()
+        manifest["last_verified_export_at"] = now
+        manifest["last_verified_export_destination"] = str(destination)
+        manifest["last_verified_export_count"] = int(copied_count)
+        manifest["export_needs_refresh"] = False
+        manifest["updated_at"] = now
+        manifest.setdefault("events", []).append(
+            {
+                "type": "usb_export_verified",
+                "at": now,
+                "destination": str(destination),
+                "copied_count": int(copied_count),
+            }
+        )
+        self._atomic_write_json(manifest_path, manifest)
+
+        destination_manifest = Path(destination) / self.MANIFEST_NAME
+        try:
+            self._copy_and_verify(manifest_path, destination_manifest)
+        except Exception as error:
+            failure_time = utc_now_text()
+            manifest["export_needs_refresh"] = True
+            manifest["updated_at"] = failure_time
+            manifest.setdefault("events", []).append(
+                {
+                    "type": "usb_export_manifest_sync_failed",
+                    "at": failure_time,
+                    "destination": str(destination),
+                    "error": str(error),
+                }
+            )
+            self._atomic_write_json(manifest_path, manifest)
+            if (
+                self.current_session_dir is not None
+                and manifest_path.parent.resolve()
+                == self.current_session_dir.resolve()
+            ):
+                self.current_manifest = manifest
+                if manifest.get("status") == "active":
+                    self.active_manifest = manifest
+            raise
+
+        if (
+            self.current_session_dir is not None
+            and manifest_path.parent.resolve()
+            == self.current_session_dir.resolve()
+        ):
+            self.current_manifest = manifest
+            if manifest.get("status") == "active":
+                self.active_manifest = manifest
+        return now
 
     # ========================================================
     # USB
@@ -727,6 +1009,8 @@ class StorageManager:
                 f"The batch manifest could not be read: {error}"
             ) from error
 
+        cls._validate_session_integrity(manifest_path, manifest)
+
         safe_folder = str(manifest.get("safe_barcode_folder") or "")
         session_id = str(manifest.get("session_id") or "")
         if (
@@ -746,14 +1030,20 @@ class StorageManager:
             / session_id
         )
         copied = 0
+        deleted_filenames = set()
         for item in manifest.get("images", []):
-            if not isinstance(item, dict) or item.get("status") != "saved":
+            if not isinstance(item, dict):
                 continue
             filename = str(item.get("filename") or "")
             if not filename or Path(filename).name != filename:
                 raise StorageError(
                     "The manifest contains an unsafe image filename."
                 )
+            if item.get("status") == "deleted":
+                deleted_filenames.add(filename)
+                continue
+            if item.get("status") != "saved":
+                continue
             image_path = session_dir / filename
             if not image_path.is_file():
                 raise StorageError(
@@ -769,6 +1059,18 @@ class StorageManager:
             manifest_path,
             destination_dir / manifest_path.name,
         )
+
+        # A later verified export must reflect audited local deletions. Remove
+        # only filenames explicitly marked deleted by this session manifest;
+        # never clean unrelated USB files or broader directories.
+        for filename in deleted_filenames:
+            stale_destination = destination_dir / filename
+            try:
+                stale_destination.unlink(missing_ok=True)
+            except OSError as error:
+                raise StorageError(
+                    f"Could not remove deleted USB image {filename}: {error}"
+                ) from error
         return copied, destination_dir
 
     def copy_all_images_to_usb(self, image_files=None):

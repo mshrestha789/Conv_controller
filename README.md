@@ -84,6 +84,26 @@ batch editing, and shutdown are locked until export finishes.
 Removing the USB before the success message is shown can leave an incomplete
 export; the Raspberry Pi copy remains intact.
 
+## Batch History
+
+Starting a new barcode does not remove or hide earlier data permanently. Open
+**PHOTOS → BATCH HISTORY** to browse all active, completed, and cancelled
+sessions. Each entry shows its barcode, creation time, status, saved-photo
+count, expected count, and verified USB-export state. Any stored batch can be
+selected and exported later, so USB copying is not required before starting
+the next batch.
+
+Photos in completed or cancelled sessions can be permanently deleted from
+Batch History. The operator must select the exact batch and photo and accept a
+destructive confirmation that defaults to **No**. The manifest retains the
+filename, deletion timestamp, source, remaining count, and audit event. Active
+batches cannot be deleted through history. If the batch was exported before a
+deletion, the old USB copy is unchanged and the application marks the local
+batch as requiring a fresh export.
+On that re-export, the USB exporter removes only JPEG filenames explicitly
+marked deleted in the selected session manifest; it does not clean unrelated
+USB files or directories.
+
 ## Tested hardware/config values
 
 The supplied `config.py` preserves the values from the configuration tested with the previous working version:
