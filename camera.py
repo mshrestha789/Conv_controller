@@ -457,10 +457,16 @@ class Camera(QObject):
         if not save_path:
             return
 
-        try:
-            Path(save_path).unlink(missing_ok=True)
-        except OSError:
-            pass
+        save_path = Path(save_path)
+        temporary_path = save_path.with_name(
+            f".{save_path.stem}.partial{save_path.suffix}"
+        )
+
+        for path in (save_path, temporary_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _detach_process(self, process):
         try:

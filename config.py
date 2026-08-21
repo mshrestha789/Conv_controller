@@ -15,6 +15,21 @@ FULLSCREEN = True  # Final Raspberry Pi touchscreen / kiosk use.
 
 IMAGE_DIR = Path.home() / "stem_conveyor" / "images"
 
+# Barcode batches are stored below IMAGE_DIR. The active-session pointer is
+# written atomically so an interrupted run can be offered for recovery after
+# an application or power restart.
+ACTIVE_BATCH_STATE_FILE = IMAGE_DIR / ".active_batch.json"
+
+# Refuse a new capture when the local disk is nearly full. High-resolution
+# images can consume substantial space during 50-100 sample batches.
+MIN_FREE_STORAGE_BYTES = 1024 * 1024 * 1024  # 1 GiB
+
+# USB-HID scanners normally append Enter. A second decode received within this
+# interval is treated as a duplicate; the active-batch lock remains the primary
+# protection against accidental rescans.
+BARCODE_DUPLICATE_WINDOW_SEC = 2.0
+BARCODE_MAX_LENGTH = 128
+
 
 # ============================================================
 # GPIO CONFIGURATION
