@@ -156,6 +156,102 @@ class StorageManagerTests(unittest.TestCase):
         self.assertTrue(response["success"])
         self.assertEqual(response["copied"], 1)
 
+    def test_history_lists_old_session_without_replacing_active_batch(self):
+        manager = self.manager()
+        manager.create_batch("FIRST")
+        self.fake_capture(manager)
+        first_manifest = manager._manifest_path()
+        manager.complete_batch()
+
+        manager.create_batch("SECOND")
+        second_session = manager.active_manifest["session_id"]
+        sessions = manager.list_sessions()
+
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(sessions[0]["barcode"], "SECOND")
+        self.assertEqual(sessions[1]["barcode"], "FIRST")
+        self.assertEqual(
+            manager.active_manifest["session_id"],
+            second_session,
+        )
+        self.assertEqual(len(manager.get_session_images(first_manifest)), 1)
+
+    def test_history_can_delete_finalized_photo_with_audit(self):
+        manager = self.manager()
+        manager.create_batch("DELETE-OLD", expected_count=1)
+        image_path = self.fake_capture(manager)
+        manifest_path = manager._manifest_path()
+        manager.complete_batch()
+
+        remaining = manager.delete_historical_image(
+            manifest_path,
+            image_path,
+        )
+        _, manifest = manager.load_session_manifest(manifest_path)
+
+        self.assertEqual(remaining, 0)
+        self.assertFalse(image_path.exists())
+        self.assertEqual(manifest["actual_count"], 0)
+        self.assertFalse(manifest["count_matches_expected"])
+        self.assertEqual(manifest["images"][0]["status"], "deleted")
+        self.assertEqual(
+            manifest["events"][-1]["type"],
+            "historical_image_deleted",
+        )
+
+    def test_history_refuses_to_delete_active_batch_photo(self):
+        manager = self.manager()
+        manager.create_batch("ACTIVE")
+        image_path = self.fake_capture(manager)
+
+        with self.assertRaises(StorageError):
+            manager.delete_historical_image(
+                manager._manifest_path(),
+                image_path,
+            )
+
+        self.assertTrue(image_path.exists())
+
+    def test_verified_export_is_recorded_and_deletion_marks_it_stale(self):
+        usb_mount = self.mount_roots / "USB3"
+        usb_mount.mkdir()
+        manager = self.manager()
+        manager.create_batch("EXPORT-TRACK")
+        image_path = self.fake_capture(manager)
+        manifest_path = manager._manifest_path()
+        manager.complete_batch()
+
+        copied, destination = StorageManager.export_session_to_usb(
+            manifest_path,
+            usb_mount,
+        )
+        manager.record_verified_usb_export(
+            manifest_path,
+            destination,
+            copied,
+        )
+        _, exported = manager.load_session_manifest(manifest_path)
+        self.assertTrue(exported["last_verified_export_at"])
+        self.assertFalse(exported["export_needs_refresh"])
+
+        manager.delete_historical_image(manifest_path, image_path)
+        _, modified = manager.load_session_manifest(manifest_path)
+        self.assertTrue(modified["export_needs_refresh"])
+
+        copied_again, destination_again = StorageManager.export_session_to_usb(
+            manifest_path,
+            usb_mount,
+        )
+        manager.record_verified_usb_export(
+            manifest_path,
+            destination_again,
+            copied_again,
+        )
+        self.assertEqual(copied_again, 0)
+        self.assertFalse((destination_again / image_path.name).exists())
+        _, refreshed = manager.load_session_manifest(manifest_path)
+        self.assertFalse(refreshed["export_needs_refresh"])
+
 
 if __name__ == "__main__":
     unittest.main()
