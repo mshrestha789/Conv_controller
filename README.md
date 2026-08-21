@@ -20,8 +20,9 @@ this application. Insulate them separately so they cannot short accidentally.
 
 1. With the belt stopped, scan the batch barcode once.
 2. Confirm that the BATCH field shows the correct value.
-3. Optionally set **EXPECTED** to the total number of samples. Leave it at
-   `Unknown` when the total is not known in advance.
+3. Optionally tap **EXPECTED SAMPLES — NOT SET** and enter the total using the
+   touch keypad. Presets are provided for 10, 50, and 100. Leave it as
+   **NOT SET** when the total is not known in advance.
 4. Load samples in the physical groups required by the process (for example,
    seven at a time), then press **START BELT**.
 5. Use **STOP / PAUSE** whenever more samples must be loaded. The barcode batch
@@ -29,6 +30,11 @@ this application. Insulate them separately so they cannot short accidentally.
 6. When all samples for that barcode are finished, stop the belt and press
    **COMPLETE BATCH**. Confirm the displayed count.
 7. Scan the next barcode and repeat.
+
+When an expected total is set, its button shows live progress such as
+`23 / 50`. The button is disabled until a barcode batch exists and while the
+belt is moving. Reaching the expected total keeps the belt stopped, but the
+operator must still confirm **COMPLETE BATCH**.
 
 The batch locks after the first valid scan. Rapid duplicate scans and all
 later scans—whether the same or a different code—are ignored until the operator

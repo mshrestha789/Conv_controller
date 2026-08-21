@@ -7,11 +7,13 @@ from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QWidget,
     QLabel,
     QLineEdit,
     QPushButton,
-    QSpinBox,
+    QGridLayout,
     QVBoxLayout,
     QHBoxLayout,
     QMessageBox,
@@ -41,6 +43,168 @@ from config import (
 from hardware import Hardware
 from camera import Camera
 from storage import StorageError, StorageManager
+
+
+class ExpectedSamplesDialog(QDialog):
+    """Touch-only expected-sample entry with safe scanner behavior."""
+
+    MAX_EXPECTED_SAMPLES = 10000
+
+    def __init__(self, parent, current_value, captured_count):
+        super().__init__(parent)
+        self.setWindowTitle("Expected Samples")
+        self.setModal(True)
+        self.selected_value = None
+        self.captured_count = max(0, int(captured_count))
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            self.resize(
+                min(470, max(1, available.width() - 60)),
+                min(570, max(1, available.height() - 50)),
+            )
+        else:
+            self.resize(440, 550)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
+
+        title = QLabel("EXPECTED SAMPLES (OPTIONAL)")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 20px; font-weight: 800;")
+        root.addWidget(title)
+
+        explanation = QLabel(
+            f"Photos already saved: {self.captured_count}\n"
+            "Enter the total samples for this barcode, or choose NOT SET."
+        )
+        explanation.setAlignment(Qt.AlignCenter)
+        explanation.setWordWrap(True)
+        explanation.setStyleSheet("font-size: 16px;")
+        root.addWidget(explanation)
+
+        self.value_edit = QLineEdit()
+        self.value_edit.setAlignment(Qt.AlignCenter)
+        self.value_edit.setMaxLength(5)
+        self.value_edit.setInputMethodHints(
+            Qt.ImhDigitsOnly | Qt.ImhNoPredictiveText
+        )
+        self.value_edit.setMinimumHeight(52)
+        self.value_edit.setStyleSheet("font-size: 26px; font-weight: 800;")
+        if current_value > 0:
+            self.value_edit.setText(str(current_value))
+        self.value_edit.textChanged.connect(self._sanitize_value)
+        root.addWidget(self.value_edit)
+
+        self.validation_label = QLabel("")
+        self.validation_label.setAlignment(Qt.AlignCenter)
+        self.validation_label.setStyleSheet(
+            "color: #c44949; font-size: 14px; font-weight: 700;"
+        )
+        root.addWidget(self.validation_label)
+
+        presets = QHBoxLayout()
+        presets.setSpacing(8)
+        not_set_button = self._touch_button("NOT SET")
+        not_set_button.clicked.connect(self._choose_not_set)
+        presets.addWidget(not_set_button)
+        for value in (10, 50, 100):
+            button = self._touch_button(str(value))
+            button.clicked.connect(
+                lambda checked=False, selected=value: self.value_edit.setText(
+                    str(selected)
+                )
+            )
+            button.setEnabled(value >= self.captured_count)
+            presets.addWidget(button)
+        root.addLayout(presets)
+
+        keypad = QGridLayout()
+        keypad.setSpacing(8)
+        for index, digit in enumerate("123456789"):
+            button = self._touch_button(digit)
+            button.clicked.connect(
+                lambda checked=False, selected=digit: self._append_digit(
+                    selected
+                )
+            )
+            keypad.addWidget(button, index // 3, index % 3)
+
+        clear_button = self._touch_button("CLEAR")
+        clear_button.clicked.connect(self.value_edit.clear)
+        keypad.addWidget(clear_button, 3, 0)
+        zero_button = self._touch_button("0")
+        zero_button.clicked.connect(lambda checked=False: self._append_digit("0"))
+        keypad.addWidget(zero_button, 3, 1)
+        backspace_button = self._touch_button("⌫")
+        backspace_button.clicked.connect(self.value_edit.backspace)
+        keypad.addWidget(backspace_button, 3, 2)
+        root.addLayout(keypad, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Save | QDialogButtonBox.Cancel
+        )
+        self.save_button = buttons.button(QDialogButtonBox.Save)
+        self.save_button.setText("SAVE EXPECTED COUNT")
+        self.save_button.setMinimumHeight(48)
+        self.save_button.setAutoDefault(False)
+        cancel_button = buttons.button(QDialogButtonBox.Cancel)
+        cancel_button.setMinimumHeight(48)
+        cancel_button.setDefault(True)
+        buttons.accepted.connect(self._save_value)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        # A barcode scanner also sends Enter. Enter intentionally activates
+        # CANCEL, never SAVE, while this modal dialog is open.
+        self._sanitize_value(self.value_edit.text())
+        self.value_edit.setFocus()
+
+    @staticmethod
+    def _touch_button(text):
+        button = QPushButton(text)
+        button.setMinimumHeight(52)
+        button.setFocusPolicy(Qt.NoFocus)
+        button.setStyleSheet("font-size: 18px; font-weight: 750;")
+        return button
+
+    def _append_digit(self, digit):
+        if len(self.value_edit.text()) < 5:
+            self.value_edit.insert(digit)
+
+    def _sanitize_value(self, text):
+        clean = "".join(character for character in text if character.isdigit())
+        clean = clean[:5]
+        if clean != text:
+            self.value_edit.setText(clean)
+            return
+        value = int(clean or 0)
+        minimum = max(1, self.captured_count)
+        self.save_button.setEnabled(
+            minimum <= value <= self.MAX_EXPECTED_SAMPLES
+        )
+        if clean and value < self.captured_count:
+            self.validation_label.setText(
+                f"Total cannot be less than {self.captured_count} saved photos."
+            )
+        elif value > self.MAX_EXPECTED_SAMPLES:
+            self.validation_label.setText(
+                f"Maximum allowed total is {self.MAX_EXPECTED_SAMPLES}."
+            )
+        else:
+            self.validation_label.clear()
+
+    def _choose_not_set(self):
+        self.selected_value = 0
+        self.accept()
+
+    def _save_value(self):
+        value = int(self.value_edit.text() or 0)
+        if max(1, self.captured_count) <= value <= self.MAX_EXPECTED_SAMPLES:
+            self.selected_value = value
+            self.accept()
 
 
 class StemConveyorGUI(QWidget):
@@ -303,14 +467,15 @@ class StemConveyorGUI(QWidget):
             "Present one batch barcode. Scanning never starts the conveyor."
         )
 
-        self.expected_count = QSpinBox()
-        self.expected_count.setObjectName("expectedCount")
-        self.expected_count.setRange(0, 10000)
-        self.expected_count.setSpecialValueText("Unknown")
-        self.expected_count.setPrefix("Expected: ")
-        self.expected_count.setMinimumWidth(150)
-        self.expected_count.setMinimumHeight(44)
-        self.expected_count.setFocusPolicy(Qt.NoFocus)
+        self.expected_count_button = QPushButton(
+            "EXPECTED SAMPLES\nNOT SET"
+        )
+        self.expected_count_button.setObjectName("expectedCountButton")
+        self.expected_count_button.setMinimumWidth(180)
+        self.expected_count_button.setMinimumHeight(48)
+        self.expected_count_button.setToolTip(
+            "Optional total sample count. Tap to enter using the keypad."
+        )
 
         self.btn_complete_batch = QPushButton("COMPLETE BATCH")
         self.btn_complete_batch.setObjectName("completeBatchButton")
@@ -370,8 +535,8 @@ class StemConveyorGUI(QWidget):
 
     def _connect_ui_signals(self):
         self.barcode_edit.returnPressed.connect(self.handle_barcode_scan)
-        self.expected_count.valueChanged.connect(
-            self._on_expected_count_changed
+        self.expected_count_button.clicked.connect(
+            self.open_expected_samples_dialog
         )
         self.btn_complete_batch.clicked.connect(self.complete_batch)
         self.btn_cancel_batch.clicked.connect(self.cancel_batch)
@@ -558,7 +723,7 @@ class StemConveyorGUI(QWidget):
         batch_row.addWidget(title)
         batch_row.addWidget(self.batch_value_label, stretch=2)
         batch_row.addWidget(self.barcode_edit, stretch=2)
-        batch_row.addWidget(self.expected_count)
+        batch_row.addWidget(self.expected_count_button)
         batch_row.addWidget(self.btn_complete_batch)
         batch_row.addWidget(self.btn_cancel_batch)
         return batch_row
@@ -720,7 +885,7 @@ class StemConveyorGUI(QWidget):
                 padding: 7px;
             }
 
-            QLineEdit#barcodeInput, QSpinBox#expectedCount {
+            QLineEdit#barcodeInput, QPushButton#expectedCountButton {
                 background-color: white;
                 color: #172033;
                 border: 2px solid #9db4dd;
@@ -728,6 +893,12 @@ class StemConveyorGUI(QWidget):
                 font-size: 15px;
                 font-weight: 700;
                 padding: 6px;
+            }
+
+            QPushButton#expectedCountButton:disabled {
+                background-color: #eef2f7;
+                color: #718096;
+                border-color: #d6deea;
             }
 
             QLineEdit#barcodeInput:focus {
@@ -957,38 +1128,42 @@ class StemConveyorGUI(QWidget):
     def _refresh_batch_ui(self):
         manifest = self.storage.active_manifest
 
-        self.expected_count.blockSignals(True)
-        try:
-            if manifest is not None:
-                barcode = str(manifest.get("barcode") or "")
-                display = barcode
-                if len(display) > 28:
-                    display = f"{display[:25]}..."
+        if manifest is not None:
+            barcode = str(manifest.get("barcode") or "")
+            display = barcode
+            if len(display) > 28:
+                display = f"{display[:25]}..."
 
-                self.active_batch_id = barcode
-                self.batch_value_label.setText(display)
-                self.batch_value_label.setToolTip(barcode)
-                self.batch_value_label.setStyleSheet(
-                    "background-color: #e5f6ef; color: #146b49;"
-                )
-                self.barcode_edit.setPlaceholderText(
-                    "Batch locked - later scans are ignored"
-                )
-                self.expected_count.setValue(
-                    int(manifest.get("expected_count") or 0)
+            self.active_batch_id = barcode
+            self.batch_value_label.setText(display)
+            self.batch_value_label.setToolTip(barcode)
+            self.batch_value_label.setStyleSheet(
+                "background-color: #e5f6ef; color: #146b49;"
+            )
+            self.barcode_edit.setPlaceholderText(
+                "Batch locked - later scans are ignored"
+            )
+            expected = int(manifest.get("expected_count") or 0)
+            actual = self.storage.current_photo_count()
+            if expected > 0:
+                self.expected_count_button.setText(
+                    f"EXPECTED SAMPLES\n{actual} / {expected}"
                 )
             else:
-                self.active_batch_id = None
-                self.batch_value_label.setText("NO ACTIVE BATCH")
-                self.batch_value_label.setToolTip("")
-                self.batch_value_label.setStyleSheet("")
-                self.barcode_edit.setPlaceholderText(
-                    "Scan new batch barcode"
+                self.expected_count_button.setText(
+                    "EXPECTED SAMPLES\nNOT SET"
                 )
-                if not self.recovery_pending:
-                    self.expected_count.setValue(0)
-        finally:
-            self.expected_count.blockSignals(False)
+        else:
+            self.active_batch_id = None
+            self.batch_value_label.setText("NO ACTIVE BATCH")
+            self.batch_value_label.setToolTip("")
+            self.batch_value_label.setStyleSheet("")
+            self.barcode_edit.setPlaceholderText(
+                "Scan new batch barcode"
+            )
+            self.expected_count_button.setText(
+                "EXPECTED SAMPLES\nNOT SET"
+            )
 
         blocked = bool(
             self.storage.recovery_error
@@ -1010,7 +1185,7 @@ class StemConveyorGUI(QWidget):
         )
         self.btn_complete_batch.setEnabled(has_batch and not busy)
         self.btn_cancel_batch.setEnabled(has_batch and not busy)
-        self.expected_count.setEnabled(
+        self.expected_count_button.setEnabled(
             has_batch
             and not self.conveyor_running
             and not busy
@@ -1150,7 +1325,7 @@ class StemConveyorGUI(QWidget):
         try:
             self.storage.create_batch(
                 code,
-                expected_count=self.expected_count.value(),
+                expected_count=0,
             )
         except StorageError as error:
             QMessageBox.warning(
@@ -1173,7 +1348,7 @@ class StemConveyorGUI(QWidget):
         )
         self.update_status_display()
 
-    def _on_expected_count_changed(self, value):
+    def open_expected_samples_dialog(self):
         if (
             self.storage.active_manifest is None
             or self.recovery_pending
@@ -1183,10 +1358,41 @@ class StemConveyorGUI(QWidget):
         ):
             return
 
+        current_value = int(
+            self.storage.active_manifest.get("expected_count") or 0
+        )
+        dialog = ExpectedSamplesDialog(
+            self,
+            current_value=current_value,
+            captured_count=self.storage.current_photo_count(),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            QTimer.singleShot(0, self._focus_barcode_input)
+            return
+
+        value = dialog.selected_value
+        if value is None:
+            QTimer.singleShot(0, self._focus_barcode_input)
+            return
+
         try:
             self.storage.update_expected_count(value)
         except StorageError as error:
             self._handle_storage_failure(str(error))
+            return
+
+        self._refresh_batch_ui()
+        if value > 0:
+            self._say(
+                f"Expected sample count set to {value}. "
+                "The belt remains stopped until START BELT is pressed."
+            )
+        else:
+            self._say(
+                "Expected sample count is not set. Complete the batch "
+                "manually when all samples are finished."
+            )
+        self.update_status_display()
 
     def complete_batch(self):
         if self.storage.active_manifest is None:
@@ -2713,9 +2919,18 @@ class StemConveyorGUI(QWidget):
         expected = int(
             active_manifest.get("expected_count") or 0
         ) if active_manifest is not None else 0
+        actual = self.storage.current_photo_count()
+        if active_manifest is not None and expected > 0:
+            self.expected_count_button.setText(
+                f"EXPECTED SAMPLES\n{actual} / {expected}"
+            )
+        else:
+            self.expected_count_button.setText(
+                "EXPECTED SAMPLES\nNOT SET"
+            )
         count_limit_reached = (
             expected > 0
-            and self.storage.current_photo_count() >= expected
+            and actual >= expected
         )
         batch_ready = (
             active_manifest is not None
@@ -2752,7 +2967,7 @@ class StemConveyorGUI(QWidget):
         )
         self.btn_complete_batch.setEnabled(batch_action_ready)
         self.btn_cancel_batch.setEnabled(batch_action_ready)
-        self.expected_count.setEnabled(
+        self.expected_count_button.setEnabled(
             batch_action_ready and not self.conveyor_running
         )
         storage_action_ready = (
