@@ -1,14 +1,17 @@
-from datetime import datetime
+import json
 from pathlib import Path
+import sys
 import time
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QProcess, Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
     QLabel,
+    QLineEdit,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QHBoxLayout,
     QMessageBox,
@@ -21,7 +24,7 @@ from PySide6.QtWidgets import (
 
 from config import (
     APP_TITLE,
-    IMAGE_DIR,
+    BARCODE_DUPLICATE_WINDOW_SEC,
     DEFAULT_DIRECTION,
     DIRECTION_CHANGE_DEAD_TIME_MS,
     SENSOR_TO_STOP_DELAY_SEC,
@@ -37,7 +40,7 @@ from config import (
 
 from hardware import Hardware
 from camera import Camera
-from storage import StorageManager
+from storage import StorageError, StorageManager
 
 
 class StemConveyorGUI(QWidget):
@@ -87,6 +90,21 @@ class StemConveyorGUI(QWidget):
         )
         self.storage = StorageManager()
 
+        # Barcode-batch state is persisted by StorageManager. A batch found
+        # after restart is locked until the operator explicitly resumes or
+        # closes it; the conveyor can never start while recovery is pending.
+        self.active_batch_id = None
+        if self.storage.active_manifest is not None:
+            self.active_batch_id = self.storage.active_manifest.get(
+                "barcode"
+            )
+        self.recovery_pending = self.active_batch_id is not None
+        self.storage_fault_message = ""
+        self.last_scan_code = None
+        self.last_scan_at = 0.0
+        self.usb_export_in_progress = False
+        self.usb_export_process = None
+
         # ====================================================
         # SYSTEM STATE
         # ====================================================
@@ -131,7 +149,7 @@ class StemConveyorGUI(QWidget):
 
         self.image_files = []
         self.current_index = -1
-        self.session_photo_count = 0
+        self.session_photo_count = self.storage.current_photo_count()
 
         # ====================================================
         # WINDOW
@@ -161,6 +179,14 @@ class StemConveyorGUI(QWidget):
         self._build_ui()
         self._apply_styles()
         self.refresh_image_list()
+        self._refresh_batch_ui()
+
+        if self.storage.recovery_error:
+            QTimer.singleShot(0, self._show_batch_recovery_error)
+        elif self.recovery_pending:
+            QTimer.singleShot(0, self._prompt_incomplete_batch_recovery)
+        else:
+            QTimer.singleShot(0, self._focus_barcode_input)
 
         # ====================================================
         # SENSOR TIMER
@@ -249,6 +275,7 @@ class StemConveyorGUI(QWidget):
 
         self.image_list = QListWidget()
         self.image_list.setObjectName("imageList")
+        self.image_list.setFocusPolicy(Qt.NoFocus)
         self.image_list.setSizePolicy(
             QSizePolicy.Expanding,
             QSizePolicy.Expanding,
@@ -261,10 +288,42 @@ class StemConveyorGUI(QWidget):
             self.image_preview.setMinimumSize(620, 360)
             self.image_list.setMinimumWidth(300)
 
+        self.batch_value_label = QLabel("NO ACTIVE BATCH")
+        self.batch_value_label.setObjectName("batchValue")
+        self.batch_value_label.setAlignment(Qt.AlignCenter)
+        self.batch_value_label.setMinimumHeight(42)
+
+        self.barcode_edit = QLineEdit()
+        self.barcode_edit.setObjectName("barcodeInput")
+        self.barcode_edit.setPlaceholderText("Scan batch barcode")
+        self.barcode_edit.setMaxLength(128)
+        self.barcode_edit.setClearButtonEnabled(True)
+        self.barcode_edit.setMinimumHeight(44)
+        self.barcode_edit.setToolTip(
+            "Present one batch barcode. Scanning never starts the conveyor."
+        )
+
+        self.expected_count = QSpinBox()
+        self.expected_count.setObjectName("expectedCount")
+        self.expected_count.setRange(0, 10000)
+        self.expected_count.setSpecialValueText("Unknown")
+        self.expected_count.setPrefix("Expected: ")
+        self.expected_count.setMinimumWidth(150)
+        self.expected_count.setMinimumHeight(44)
+        self.expected_count.setFocusPolicy(Qt.NoFocus)
+
+        self.btn_complete_batch = QPushButton("COMPLETE BATCH")
+        self.btn_complete_batch.setObjectName("completeBatchButton")
+        self.btn_complete_batch.setMinimumHeight(44)
+
+        self.btn_cancel_batch = QPushButton("CANCEL BATCH")
+        self.btn_cancel_batch.setObjectName("cancelBatchButton")
+        self.btn_cancel_batch.setMinimumHeight(44)
+
         self.btn_start = QPushButton("▶  START BELT")
         self.btn_start.setObjectName("startButton")
 
-        self.btn_stop = QPushButton("■  STOP BELT")
+        self.btn_stop = QPushButton("■  STOP / PAUSE")
         self.btn_stop.setObjectName("stopButton")
 
         self.btn_reset = QPushButton("↻  RESET SYSTEM")
@@ -282,7 +341,7 @@ class StemConveyorGUI(QWidget):
         self.btn_prev = QPushButton("◀ Previous")
         self.btn_next = QPushButton("Next ▶")
         self.btn_copy_current = QPushButton("Save This to USB")
-        self.btn_copy_all = QPushButton("Save All to USB")
+        self.btn_copy_all = QPushButton("Save Batch to USB")
         self.btn_delete = QPushButton("Delete Photo")
         self.btn_exit = QPushButton("Exit")
 
@@ -310,6 +369,13 @@ class StemConveyorGUI(QWidget):
         self.auto_mode_label.setAlignment(Qt.AlignCenter)
 
     def _connect_ui_signals(self):
+        self.barcode_edit.returnPressed.connect(self.handle_barcode_scan)
+        self.expected_count.valueChanged.connect(
+            self._on_expected_count_changed
+        )
+        self.btn_complete_batch.clicked.connect(self.complete_batch)
+        self.btn_cancel_batch.clicked.connect(self.cancel_batch)
+
         self.btn_start.clicked.connect(self.start_system)
         self.btn_stop.clicked.connect(self.stop_system)
         self.btn_reset.clicked.connect(self.reset_system)
@@ -327,6 +393,12 @@ class StemConveyorGUI(QWidget):
         self.btn_open_photos.clicked.connect(self._show_photo_page)
         self.btn_back_to_main.clicked.connect(self._show_control_page)
 
+        # The barcode scanner appends Enter. Touching an ordinary control must
+        # not move keyboard focus away from the scanner sink, otherwise a late
+        # duplicate scan could activate a focused button.
+        for button in self.findChildren(QPushButton):
+            button.setFocusPolicy(Qt.NoFocus)
+
     def _build_desktop_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
@@ -335,6 +407,7 @@ class StemConveyorGUI(QWidget):
         root.addWidget(self.header)
         root.addWidget(self.subtitle)
         root.addLayout(self._make_status_row(10))
+        root.addLayout(self._make_batch_row(10))
 
         middle = QHBoxLayout()
         middle.setSpacing(14)
@@ -396,6 +469,7 @@ class StemConveyorGUI(QWidget):
         self.subtitle.hide()
         self.auto_mode_label.hide()
         root.addLayout(self._make_status_row(6))
+        root.addLayout(self._make_batch_row(6))
 
         self.compact_stack = QStackedWidget()
         self.compact_stack.setObjectName("compactPages")
@@ -474,6 +548,20 @@ class StemConveyorGUI(QWidget):
             status_row, "USB", "NOT FOUND"
         )
         return status_row
+
+    def _make_batch_row(self, spacing):
+        batch_row = QHBoxLayout()
+        batch_row.setSpacing(spacing)
+
+        title = QLabel("BATCH")
+        title.setObjectName("batchTitle")
+        batch_row.addWidget(title)
+        batch_row.addWidget(self.batch_value_label, stretch=2)
+        batch_row.addWidget(self.barcode_edit, stretch=2)
+        batch_row.addWidget(self.expected_count)
+        batch_row.addWidget(self.btn_complete_batch)
+        batch_row.addWidget(self.btn_cancel_batch)
+        return batch_row
 
     def _make_preview_panel(self):
         preview_panel = QFrame()
@@ -616,6 +704,36 @@ class StemConveyorGUI(QWidget):
                 font-size: 13px;
             }
 
+            QLabel#batchTitle {
+                color: #52637a;
+                font-size: 14px;
+                font-weight: 800;
+            }
+
+            QLabel#batchValue {
+                background-color: #eef2f7;
+                color: #52637a;
+                border: 1px solid #d6deea;
+                border-radius: 9px;
+                font-size: 15px;
+                font-weight: 800;
+                padding: 7px;
+            }
+
+            QLineEdit#barcodeInput, QSpinBox#expectedCount {
+                background-color: white;
+                color: #172033;
+                border: 2px solid #9db4dd;
+                border-radius: 9px;
+                font-size: 15px;
+                font-weight: 700;
+                padding: 6px;
+            }
+
+            QLineEdit#barcodeInput:focus {
+                border-color: #2457d6;
+            }
+
             QLabel#imagePreview {
                 background-color: #182033;
                 color: #dce6ff;
@@ -706,6 +824,16 @@ class StemConveyorGUI(QWidget):
 
             QPushButton#photoButton:hover {
                 background-color: #1c63b4;
+            }
+
+            QPushButton#completeBatchButton {
+                background-color: #2457d6;
+                color: white;
+            }
+
+            QPushButton#cancelBatchButton {
+                background-color: #d9822b;
+                color: white;
             }
 
             QPushButton#smallButton {
@@ -819,10 +947,433 @@ class StemConveyorGUI(QWidget):
             )
 
     # ========================================================
+    # BARCODE BATCH CONTROL
+    # ========================================================
+
+    def _focus_barcode_input(self):
+        if hasattr(self, "barcode_edit") and self.barcode_edit.isEnabled():
+            self.barcode_edit.setFocus(Qt.OtherFocusReason)
+
+    def _refresh_batch_ui(self):
+        manifest = self.storage.active_manifest
+
+        self.expected_count.blockSignals(True)
+        try:
+            if manifest is not None:
+                barcode = str(manifest.get("barcode") or "")
+                display = barcode
+                if len(display) > 28:
+                    display = f"{display[:25]}..."
+
+                self.active_batch_id = barcode
+                self.batch_value_label.setText(display)
+                self.batch_value_label.setToolTip(barcode)
+                self.batch_value_label.setStyleSheet(
+                    "background-color: #e5f6ef; color: #146b49;"
+                )
+                self.barcode_edit.setPlaceholderText(
+                    "Batch locked - later scans are ignored"
+                )
+                self.expected_count.setValue(
+                    int(manifest.get("expected_count") or 0)
+                )
+            else:
+                self.active_batch_id = None
+                self.batch_value_label.setText("NO ACTIVE BATCH")
+                self.batch_value_label.setToolTip("")
+                self.batch_value_label.setStyleSheet("")
+                self.barcode_edit.setPlaceholderText(
+                    "Scan new batch barcode"
+                )
+                if not self.recovery_pending:
+                    self.expected_count.setValue(0)
+        finally:
+            self.expected_count.blockSignals(False)
+
+        blocked = bool(
+            self.storage.recovery_error
+            or self.storage_fault_message
+            or self.recovery_pending
+            or self.usb_export_in_progress
+        )
+        has_batch = manifest is not None and not blocked
+        busy = (
+            self.capture_cycle_in_progress
+            or self.direction_change_in_progress
+            or self.reset_in_progress
+        )
+
+        self.barcode_edit.setEnabled(
+            not self.storage.recovery_error
+            and not self.storage_fault_message
+            and not self.usb_export_in_progress
+        )
+        self.btn_complete_batch.setEnabled(has_batch and not busy)
+        self.btn_cancel_batch.setEnabled(has_batch and not busy)
+        self.expected_count.setEnabled(
+            has_batch
+            and not self.conveyor_running
+            and not busy
+        )
+
+        if not has_batch:
+            self.btn_complete_batch.setEnabled(False)
+            self.btn_cancel_batch.setEnabled(False)
+
+        QTimer.singleShot(0, self._focus_barcode_input)
+
+    def _show_batch_recovery_error(self):
+        self.recovery_pending = True
+        self.update_status_display()
+        QMessageBox.critical(
+            self,
+            "Batch Recovery Error",
+            "The previous batch state could not be trusted. The conveyor is "
+            "locked to prevent images from being assigned to the wrong "
+            "barcode.\n\n"
+            f"{self.storage.recovery_error}\n\n"
+            "Use developer access to inspect the image folder and active "
+            "batch state file.",
+        )
+
+    def _prompt_incomplete_batch_recovery(self):
+        manifest = self.storage.active_manifest
+        if manifest is None:
+            self.recovery_pending = False
+            self._refresh_batch_ui()
+            self.update_status_display()
+            return
+
+        barcode = manifest.get("barcode", "Unknown")
+        count = self.storage.current_photo_count()
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Incomplete Batch Found")
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setText(f"Incomplete batch: {barcode}")
+        dialog.setInformativeText(
+            f"Saved photos: {count}\n\n"
+            "Resume this batch, or close it as incomplete. The conveyor "
+            "will remain stopped until you choose."
+        )
+        resume_button = dialog.addButton(
+            "RESUME BATCH",
+            QMessageBox.AcceptRole,
+        )
+        close_button = dialog.addButton(
+            "CLOSE AS INCOMPLETE",
+            QMessageBox.DestructiveRole,
+        )
+        decide_button = dialog.addButton(
+            "DECIDE LATER",
+            QMessageBox.RejectRole,
+        )
+        dialog.setDefaultButton(decide_button)
+        dialog.setEscapeButton(decide_button)
+        dialog.exec()
+
+        if dialog.clickedButton() is resume_button:
+            self.recovery_pending = False
+            self.session_photo_count = count
+            self._say(
+                f"Batch {barcode} resumed with {count} saved photos. "
+                "Press START BELT when ready."
+            )
+
+        elif dialog.clickedButton() is close_button:
+            try:
+                self.storage.cancel_batch("closed_after_restart")
+            except StorageError as error:
+                self._handle_storage_failure(str(error))
+                return
+
+            self.recovery_pending = False
+            self.active_batch_id = None
+            self.last_scan_code = None
+            self._say(
+                "Incomplete batch closed. Scan a barcode for the next batch."
+            )
+
+        self.refresh_image_list()
+        self._refresh_batch_ui()
+        self.update_status_display()
+
+    def handle_barcode_scan(self):
+        raw_code = self.barcode_edit.text()
+        self.barcode_edit.clear()
+        QTimer.singleShot(0, self._focus_barcode_input)
+
+        try:
+            code = self.storage.validate_barcode(raw_code)
+        except StorageError as error:
+            if raw_code.strip():
+                self._say(f"Barcode rejected: {error}")
+            return
+
+        now = time.monotonic()
+
+        if self.storage.recovery_error or self.storage_fault_message:
+            self._say(
+                "Barcode ignored. Resolve the batch recovery error first."
+            )
+            return
+
+        if self.usb_export_in_progress:
+            self._say("Barcode ignored while the batch is being saved to USB.")
+            return
+
+        if self.recovery_pending:
+            self._say(
+                "Barcode ignored. Resume or close the incomplete batch first."
+            )
+            return
+
+        if self.storage.active_manifest is not None:
+            if code == self.active_batch_id:
+                self._say(
+                    f"Duplicate scan ignored. Batch {code} is already active."
+                )
+            else:
+                self._say(
+                    f"Barcode {code} ignored. Complete or cancel batch "
+                    f"{self.active_batch_id} first."
+                )
+            return
+
+        if (
+            code == self.last_scan_code
+            and now - self.last_scan_at < BARCODE_DUPLICATE_WINDOW_SEC
+        ):
+            self._say(f"Duplicate barcode {code} ignored.")
+            return
+
+        try:
+            self.storage.create_batch(
+                code,
+                expected_count=self.expected_count.value(),
+            )
+        except StorageError as error:
+            QMessageBox.warning(
+                self,
+                "Batch Could Not Be Created",
+                str(error),
+            )
+            return
+
+        self.last_scan_code = code
+        self.last_scan_at = now
+        self.active_batch_id = code
+        self.session_photo_count = 0
+        self.current_index = -1
+        self.refresh_image_list()
+        self._refresh_batch_ui()
+        self._say(
+            f"Batch {code} is ready. The belt is still stopped. "
+            "Press START BELT when the conveyor is clear."
+        )
+        self.update_status_display()
+
+    def _on_expected_count_changed(self, value):
+        if (
+            self.storage.active_manifest is None
+            or self.recovery_pending
+            or self.conveyor_running
+            or self.capture_cycle_in_progress
+            or self.usb_export_in_progress
+        ):
+            return
+
+        try:
+            self.storage.update_expected_count(value)
+        except StorageError as error:
+            self._handle_storage_failure(str(error))
+
+    def complete_batch(self):
+        if self.storage.active_manifest is None:
+            self._say("There is no active batch to complete.")
+            return
+        if self.usb_export_in_progress:
+            self._say("Wait for the USB export to finish.")
+            return
+        if (
+            self.capture_cycle_in_progress
+            or self.direction_change_in_progress
+            or self.reset_in_progress
+        ):
+            self._say(
+                "Wait for the current movement/photo/reset operation to finish."
+            )
+            return
+
+        if self.conveyor_running:
+            reply = QMessageBox.question(
+                self,
+                "Stop and Complete Batch?",
+                "The belt is still running. Stop it and continue to the "
+                "batch-completion check?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            self.stop_system()
+
+        count = self.storage.current_photo_count()
+        expected = int(
+            self.storage.active_manifest.get("expected_count") or 0
+        )
+        mismatch = expected > 0 and expected != count
+        sensor_note = (
+            "\n\nWARNING: The proximity sensor is still ACTIVE."
+            if self.hardware.stem_detected()
+            else ""
+        )
+        expected_text = (
+            f"Expected: {expected}\n" if expected > 0 else "Expected: unknown\n"
+        )
+        mismatch_text = (
+            "\nThe saved-photo count does not match the expected count."
+            if mismatch
+            else ""
+        )
+
+        reply = QMessageBox.question(
+            self,
+            "Complete Batch?",
+            f"Batch: {self.active_batch_id}\n"
+            f"Saved photos: {count}\n"
+            f"{expected_text}"
+            f"{mismatch_text}{sensor_note}\n\n"
+            "Complete this batch and unlock barcode scanning?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        completed_barcode = self.active_batch_id
+        try:
+            self.storage.complete_batch()
+        except StorageError as error:
+            self._handle_storage_failure(str(error))
+            return
+
+        self.active_batch_id = None
+        self.last_scan_code = None
+        self.last_scan_at = 0.0
+        self._refresh_batch_ui()
+        self._say(
+            f"Batch {completed_barcode} completed with {count} photos. "
+            "Scan the next batch barcode; the belt remains stopped."
+        )
+        self.update_status_display()
+
+    def cancel_batch(self):
+        if self.storage.active_manifest is None:
+            self._say("There is no active batch to cancel.")
+            return
+        if self.usb_export_in_progress:
+            self._say("Wait for the USB export to finish.")
+            return
+        if (
+            self.capture_cycle_in_progress
+            or self.direction_change_in_progress
+            or self.reset_in_progress
+        ):
+            self._say(
+                "Wait for the current movement/photo/reset operation to finish."
+            )
+            return
+
+        if self.conveyor_running:
+            self.stop_system()
+
+        count = self.storage.current_photo_count()
+        reply = QMessageBox.question(
+            self,
+            "Cancel Batch?",
+            f"Cancel batch {self.active_batch_id}?\n\n"
+            f"Saved photos: {count}\n"
+            "Photos will be retained and the manifest will be marked "
+            "CANCELLED; they will not be silently deleted.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        cancelled_barcode = self.active_batch_id
+        try:
+            self.storage.cancel_batch("operator_cancelled")
+        except StorageError as error:
+            self._handle_storage_failure(str(error))
+            return
+
+        self.active_batch_id = None
+        self.last_scan_code = None
+        self.last_scan_at = 0.0
+        self._refresh_batch_ui()
+        self._say(
+            f"Batch {cancelled_barcode} cancelled. "
+            "Scan a barcode for the next batch."
+        )
+        self.update_status_display()
+
+    def incomplete_batch_note(self):
+        if self.storage.active_manifest is None:
+            return ""
+        return (
+            f"\n\nBatch {self.active_batch_id} is still incomplete. Its "
+            "saved state will be offered for recovery on the next start."
+        )
+
+    # ========================================================
     # SYSTEM CONTROL
     # ========================================================
 
     def start_system(self):
+        if self.usb_export_in_progress:
+            self._say("Wait for the USB export to finish before starting.")
+            return
+
+        if (
+            self.storage.recovery_error
+            or self.storage_fault_message
+            or self.recovery_pending
+        ):
+            self._say(
+                "The conveyor is locked until incomplete batch recovery is resolved."
+            )
+            return
+
+        if self.storage.active_manifest is None or not self.active_batch_id:
+            self._say(
+                "Scan a valid batch barcode before starting the belt."
+            )
+            self._focus_barcode_input()
+            return
+
+        expected = int(
+            self.storage.active_manifest.get("expected_count") or 0
+        )
+        actual = self.storage.current_photo_count()
+        if expected > 0 and actual >= expected:
+            self._say(
+                f"Expected count {expected} has been reached. Complete the "
+                "batch or change the expected count before restarting."
+            )
+            return
+
+        try:
+            self.storage.check_storage_ready(require_active=True)
+        except StorageError as error:
+            QMessageBox.critical(
+                self,
+                "Storage Not Ready",
+                f"The conveyor will not start.\n\n{error}",
+            )
+            return
+
         if self.reset_in_progress:
             self._say("System reset is still in progress. Please wait.")
             return
@@ -911,7 +1462,14 @@ class StemConveyorGUI(QWidget):
 
         self.hardware.conveyor_stop()
 
-        self._say("Belt stopped.")
+        if self.storage.active_manifest is not None:
+            self._say(
+                f"Batch {self.active_batch_id} paused with "
+                f"{self.storage.current_photo_count()} saved photos. "
+                "Load more samples, then press START BELT to resume."
+            )
+        else:
+            self._say("Belt stopped.")
         self.update_status_display()
 
     def reset_system(self):
@@ -919,7 +1477,8 @@ class StemConveyorGUI(QWidget):
 
         RESET SYSTEM always stops the conveyor first, cancels software timing,
         clears the current capture cycle, and restarts only the isolated camera
-        worker. It never restarts the conveyor automatically. A stuck-ACTIVE
+        worker. The active barcode batch and its saved-photo count are retained.
+        It never restarts the conveyor automatically. A stuck-ACTIVE
         sensor fault clears only if the physical proximity input is CLEAR after
         reset. A NO DETECTION fault also requires RESET before a new START.
         """
@@ -935,6 +1494,7 @@ class StemConveyorGUI(QWidget):
             "will be cleared, and the camera will restart.\n\n"
             "A stuck-ACTIVE sensor fault clears only if the proximity sensor is CLEAR.\n"
             "A NO DETECTION fault also requires RESET before another START.\n\n"
+            "The active barcode batch and saved images will be preserved.\n\n"
             "The conveyor will NOT restart automatically.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1487,10 +2047,40 @@ class StemConveyorGUI(QWidget):
             self._handle_camera_failure(message)
             return
 
-        self.session_photo_count += 1
+        try:
+            self.storage.record_capture(
+                save_path,
+                source=self.capture_source,
+            )
+        except StorageError as error:
+            self._handle_storage_failure(str(error))
+            return
+
+        self.session_photo_count = self.storage.current_photo_count()
         self.refresh_image_list(preferred_path=save_path)
 
-        if self.restart_after_capture and self.system_running:
+        expected = int(
+            self.storage.active_manifest.get("expected_count") or 0
+        )
+        expected_reached = (
+            expected > 0 and self.session_photo_count >= expected
+        )
+
+        if expected_reached:
+            # The belt is already stopped for the photo. Do not restart after
+            # the declared number of samples; the operator still explicitly
+            # reviews and completes the batch.
+            self.system_running = False
+            self.conveyor_running = False
+            self.capture_cycle_in_progress = False
+            self.capture_stage = self.STAGE_IDLE
+            self.restart_after_capture = False
+            self._say(
+                f"Expected count {expected} reached. Belt remains stopped. "
+                "Review the count, then press COMPLETE BATCH."
+            )
+
+        elif self.restart_after_capture and self.system_running:
             self.capture_stage = self.STAGE_RESTARTING
             self._say("Photo saved! Restarting the belt...")
 
@@ -1528,6 +2118,34 @@ class StemConveyorGUI(QWidget):
             "Camera Error - Belt Stopped",
             "The photo could not be completed. The conveyor has been kept OFF.\n\n"
             f"{message}",
+        )
+
+    def _handle_storage_failure(self, message):
+        # A valid image without a durable manifest entry must not be followed
+        # by another sample. Preserve files for recovery and fail closed.
+        self.hardware.conveyor_stop()
+        self.conveyor_running = False
+        self.system_running = False
+        self.no_detection_since = None
+        self.capture_cycle_in_progress = False
+        self.capture_stage = self.STAGE_IDLE
+        self.restart_after_capture = False
+        self.pending_capture_path = None
+        self.storage_fault_message = str(message)
+
+        self._say(
+            "STORAGE ERROR. Belt remains stopped. Do not continue this batch."
+        )
+        self.update_status_display()
+
+        QMessageBox.critical(
+            self,
+            "Storage Error - Belt Stopped",
+            "The batch data could not be committed safely. "
+            "The conveyor has been kept OFF.\n\n"
+            f"{message}\n\n"
+            "Do not restart until the storage problem and batch manifest "
+            "have been inspected.",
         )
 
     def restart_after_capture_cycle(self):
@@ -1587,6 +2205,39 @@ class StemConveyorGUI(QWidget):
     # ========================================================
 
     def manual_capture(self):
+        if self.usb_export_in_progress:
+            self._say("Wait for the USB export to finish before imaging.")
+            return
+
+        if self.storage.active_manifest is None:
+            self._say(
+                "Scan a batch barcode before taking a sample photo."
+            )
+            self._focus_barcode_input()
+            return
+
+        expected = int(
+            self.storage.active_manifest.get("expected_count") or 0
+        )
+        if expected > 0 and self.storage.current_photo_count() >= expected:
+            self._say(
+                "Expected sample count has been reached. Complete the batch "
+                "or increase the expected count before taking another photo."
+            )
+            return
+
+        if self.storage.recovery_error or self.storage_fault_message:
+            self._say(
+                "Storage is locked. Resolve the storage error before imaging."
+            )
+            return
+
+        if self.recovery_pending:
+            self._say(
+                "Resolve the incomplete batch before taking a photo."
+            )
+            return
+
         if self.reset_in_progress:
             self._say("System reset is in progress. Please wait.")
             return
@@ -1625,9 +2276,11 @@ class StemConveyorGUI(QWidget):
     # ========================================================
 
     def start_capture_image(self, source="auto"):
-        # Milliseconds are included so quick captures do not overwrite.
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        save_path = IMAGE_DIR / f"stem_{source}_{timestamp}.jpg"
+        try:
+            save_path = self.storage.next_capture_path(source=source)
+        except StorageError as error:
+            self._handle_storage_failure(str(error))
+            return False
 
         self.pending_capture_path = save_path
 
@@ -1661,9 +2314,14 @@ class StemConveyorGUI(QWidget):
         if not self.image_files:
             self.current_index = -1
             self.image_preview.clear()
-            self.image_preview.setText(
-                "No photos yet\n\nPress START BELT to begin."
-            )
+            if self.storage.active_manifest is None:
+                self.image_preview.setText(
+                    "No active batch\n\nScan a batch barcode to begin."
+                )
+            else:
+                self.image_preview.setText(
+                    "No photos in this batch\n\nPress START BELT when ready."
+                )
             self.update_status_display()
             return
 
@@ -1733,11 +2391,23 @@ class StemConveyorGUI(QWidget):
         self.show_current_image()
 
     def delete_current_image(self):
+        if self.usb_export_in_progress:
+            self._say("Wait for the USB export to finish.")
+            return
+
         if not self.image_files or self.current_index < 0:
             QMessageBox.information(
                 self,
                 "No Photo Selected",
                 "Choose a photo first.",
+            )
+            return
+
+        if self.storage.active_manifest is None:
+            QMessageBox.information(
+                self,
+                "Batch Is Closed",
+                "Completed and cancelled batches cannot be edited.",
             )
             return
 
@@ -1748,12 +2418,19 @@ class StemConveyorGUI(QWidget):
             "Delete Photo?",
             f"Delete this photo?\n\n{image_path.name}",
             QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
 
         if reply != QMessageBox.Yes:
             return
 
-        if not self.storage.delete_image(image_path):
+        try:
+            deleted = self.storage.delete_image(image_path)
+        except StorageError as error:
+            self._handle_storage_failure(str(error))
+            return
+
+        if not deleted:
             QMessageBox.warning(
                 self,
                 "Delete Problem",
@@ -1763,13 +2440,23 @@ class StemConveyorGUI(QWidget):
 
         self.current_index = -1
         self.refresh_image_list()
-        self._say("Photo deleted.")
+        self.session_photo_count = self.storage.current_photo_count()
+        self._say(
+            f"Photo deleted. Batch now has {self.session_photo_count} photos."
+        )
 
     # ========================================================
     # USB
     # ========================================================
 
     def copy_current_to_usb(self):
+        if self.usb_export_in_progress:
+            self._say("A USB export is already in progress.")
+            return
+        if self.conveyor_running or self.capture_cycle_in_progress:
+            self._say("Pause the belt before saving photos to USB.")
+            return
+
         if not self.image_files or self.current_index < 0:
             QMessageBox.information(
                 self,
@@ -1802,6 +2489,13 @@ class StemConveyorGUI(QWidget):
         self._say(f"Saved {image_path.name} to USB.")
 
     def copy_all_to_usb(self):
+        if self.usb_export_in_progress:
+            self._say("A USB export is already in progress.")
+            return
+        if self.conveyor_running or self.capture_cycle_in_progress:
+            self._say("Pause the belt before saving the batch to USB.")
+            return
+
         if not self.image_files:
             QMessageBox.information(
                 self,
@@ -1810,18 +2504,8 @@ class StemConveyorGUI(QWidget):
             )
             return
 
-        try:
-            copied = self.storage.copy_all_images_to_usb(self.image_files)
-
-        except Exception as error:
-            QMessageBox.warning(
-                self,
-                "USB Problem",
-                f"Photos could not be copied.\n\n{error}",
-            )
-            return
-
-        if copied is None:
+        usb_mount = self.storage.find_usb_mount()
+        if usb_mount is None:
             QMessageBox.information(
                 self,
                 "USB Not Found",
@@ -1829,7 +2513,89 @@ class StemConveyorGUI(QWidget):
             )
             return
 
-        self._say(f"Saved {copied} photos to USB.")
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.MergedChannels)
+        process.finished.connect(self._on_usb_export_finished)
+        process.errorOccurred.connect(self._on_usb_export_process_error)
+        process.setProgram(sys.executable)
+        process.setArguments(
+            [
+                str(Path(__file__).with_name("usb_export_worker.py")),
+                str(self.storage._manifest_path()),
+                str(usb_mount),
+            ]
+        )
+        self.usb_export_process = process
+        self.usb_export_in_progress = True
+        self._say(
+            "Saving and verifying the batch on USB. Keep the drive inserted..."
+        )
+        self._refresh_batch_ui()
+        self.update_status_display()
+        process.start()
+
+    def _on_usb_export_process_error(self, _process_error):
+        process = self.usb_export_process
+        if process is None or process.state() != QProcess.NotRunning:
+            return
+        self._finish_usb_export(
+            success=False,
+            message=process.errorString(),
+        )
+
+    def _on_usb_export_finished(self, exit_code, _exit_status):
+        process = self.usb_export_process
+        if process is None:
+            return
+
+        output = bytes(process.readAll()).decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
+        result = None
+        for line in reversed(output.splitlines()):
+            try:
+                result = json.loads(line)
+                break
+            except ValueError:
+                continue
+
+        if exit_code == 0 and result and result.get("success"):
+            copied = int(result.get("copied") or 0)
+            self._finish_usb_export(
+                success=True,
+                message=(
+                    f"Saved and verified {copied} batch photos plus manifest "
+                    "on USB."
+                ),
+            )
+            return
+
+        details = "USB export failed."
+        if result and result.get("error"):
+            details = str(result["error"])
+        elif output:
+            details = output
+        self._finish_usb_export(success=False, message=details)
+
+    def _finish_usb_export(self, success, message):
+        process = self.usb_export_process
+        self.usb_export_process = None
+        self.usb_export_in_progress = False
+        if process is not None:
+            process.deleteLater()
+
+        self._refresh_batch_ui()
+        self.update_status_display()
+        if success:
+            self._say(message)
+        else:
+            self._say("USB export failed. Raspberry Pi images are unchanged.")
+            QMessageBox.warning(
+                self,
+                "USB Export Failed",
+                f"The Raspberry Pi images are unchanged.\n\n{message}",
+            )
 
     # ========================================================
     # STATUS
@@ -1840,7 +2606,15 @@ class StemConveyorGUI(QWidget):
         # SYSTEM
         # ----------------------------------------------------
 
-        if self.reset_in_progress:
+        if self.storage.recovery_error or self.storage_fault_message:
+            self.system_value.setText("STORAGE ERROR")
+            self._set_status_color(self.system_value, "#c44949")
+
+        elif self.recovery_pending:
+            self.system_value.setText("BATCH RECOVERY")
+            self._set_status_color(self.system_value, "#d9822b")
+
+        elif self.reset_in_progress:
             self.system_value.setText("RESETTING")
             self._set_status_color(self.system_value, "#d9822b")
 
@@ -1915,7 +2689,7 @@ class StemConveyorGUI(QWidget):
         # PHOTOS
         # ----------------------------------------------------
 
-        self.photos_value.setText(str(len(self.image_files)))
+        self.photos_value.setText(str(self.storage.current_photo_count()))
         self._set_status_color(self.photos_value, "#2457d6")
 
         # ----------------------------------------------------
@@ -1924,7 +2698,10 @@ class StemConveyorGUI(QWidget):
 
         usb_found = self.storage.find_usb_mount() is not None
 
-        if usb_found:
+        if self.usb_export_in_progress:
+            self.usb_value.setText("SAVING")
+            self._set_status_color(self.usb_value, "#d9822b")
+        elif usb_found:
             self.usb_value.setText("READY")
             self._set_status_color(self.usb_value, "#1f8f62")
         else:
@@ -1932,20 +2709,70 @@ class StemConveyorGUI(QWidget):
             self._set_status_color(self.usb_value, "#718096")
 
         # Avoid nonessential actions during an automatic cycle.
+        active_manifest = self.storage.active_manifest
+        expected = int(
+            active_manifest.get("expected_count") or 0
+        ) if active_manifest is not None else 0
+        count_limit_reached = (
+            expected > 0
+            and self.storage.current_photo_count() >= expected
+        )
+        batch_ready = (
+            active_manifest is not None
+            and not self.recovery_pending
+            and not self.storage.recovery_error
+            and not self.storage_fault_message
+            and not self.usb_export_in_progress
+        )
+
         self.btn_start.setEnabled(
-            self.camera.ready
+            batch_ready
+            and self.camera.ready
             and not self.sensor_fault
             and not self.capture_cycle_in_progress
             and not self.reset_in_progress
             and not self.direction_change_in_progress
+            and not count_limit_reached
         )
         self.btn_manual_capture.setEnabled(
-            self.camera.ready
+            batch_ready
+            and self.camera.ready
+            and not self.capture_cycle_in_progress
+            and not self.reset_in_progress
+            and not self.direction_change_in_progress
+            and not count_limit_reached
+        )
+        self.btn_reset.setEnabled(not self.reset_in_progress)
+
+        batch_action_ready = (
+            batch_ready
             and not self.capture_cycle_in_progress
             and not self.reset_in_progress
             and not self.direction_change_in_progress
         )
-        self.btn_reset.setEnabled(not self.reset_in_progress)
+        self.btn_complete_batch.setEnabled(batch_action_ready)
+        self.btn_cancel_batch.setEnabled(batch_action_ready)
+        self.expected_count.setEnabled(
+            batch_action_ready and not self.conveyor_running
+        )
+        storage_action_ready = (
+            not self.usb_export_in_progress
+            and not self.conveyor_running
+            and not self.capture_cycle_in_progress
+            and not self.direction_change_in_progress
+            and not self.reset_in_progress
+        )
+        self.btn_copy_current.setEnabled(
+            storage_action_ready and bool(self.image_files)
+        )
+        self.btn_copy_all.setEnabled(
+            storage_action_ready and bool(self.image_files)
+        )
+        self.btn_delete.setEnabled(
+            storage_action_ready
+            and bool(self.image_files)
+            and active_manifest is not None
+        )
 
         self._update_direction_button()
 
@@ -1986,6 +2813,9 @@ class StemConveyorGUI(QWidget):
 
     def closeEvent(self, event):
         self.emergency_stop()
+        if self.usb_export_process is not None:
+            self.usb_export_process.kill()
+            self.usb_export_process.waitForFinished(1000)
         self.camera.close()
         self.hardware.cleanup()
         event.accept()

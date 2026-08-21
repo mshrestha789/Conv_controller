@@ -1,15 +1,17 @@
 # Kiosk / Developer Mode Update
 
-This update is designed as a small overlay on the currently working
-`mshrestha789/Conv_controller` code. It intentionally leaves `gui.py`,
-`camera.py`, `camera_worker.py`, `hardware.py`, `storage.py`, and `watchdog.py`
-unchanged.
+This guide applies to the barcode-batch kiosk revision of
+`mshrestha789/Conv_controller`.
 
 ## New operating model
 
 - Raspberry Pi boots to the desktop session and automatically starts the
   systemd-supervised conveyor application.
 - Application opens full screen.
+- A USB HID barcode scan opens a batch but never starts the conveyor.
+- The operator starts, pauses, completes, or cancels each batch explicitly.
+- Images and a manifest are stored under a unique barcode session folder.
+- An incomplete active batch is offered for recovery after restart.
 - The visible `Exit` button becomes `SHUT DOWN` and powers off the Pi only
   after commanding the conveyor OFF.
 - Normal window close / Alt+F4 is ignored by the application.
@@ -51,31 +53,25 @@ Hardware-critical values are deliberately **not** editable in the GUI:
 - active-low relay polarity
 - camera type / resolution
 
-## Files to copy into `~/Conv_controller`
+## Barcode scanner connection
 
-Replace:
+Connect the scanner's USB cable to the Raspberry Pi. It must be configured as
+a USB keyboard (HID) and send Enter after each barcode. At the desktop, a quick
+test is:
 
-- `config.py`
-- `main.py`
-- `systemd/stem-conveyor.service`
+```bash
+python3 -c 'code=input("Scan a barcode: "); print("Received:", repr(code))'
+```
 
-Add:
+The scanner can remain in its motion-sensing mode. Its separate red and black
+trigger wires are not needed: do not connect them to Raspberry Pi GPIO or 5 V.
+Insulate each conductor separately. The application ignores scans outside the
+barcode field once a batch is active, and scanning never starts the belt.
 
-- `kiosk_gui.py`
-- `runtime_settings.py`
-- `developer_auth.py`
-- `systemd/start-kiosk.sh`
-- `systemd/stem-conveyor-autostart.desktop`
-- `install_kiosk.sh`
-
-Leave your currently working versions of these files unchanged:
-
-- `gui.py`
-- `camera.py`
-- `camera_worker.py`
-- `hardware.py`
-- `storage.py`
-- `watchdog.py`
+Install or update the complete repository as one version. Do not copy only the
+GUI file because barcode storage, atomic camera capture, recovery, and kiosk
+shutdown behavior span `gui.py`, `storage.py`, `camera.py`, `camera_worker.py`,
+`config.py`, and `kiosk_gui.py`.
 
 ## Install auto-start and shutdown permission
 

@@ -1,13 +1,82 @@
 # Stem Conveyor Imaging System
 
-This Raspberry Pi application controls a conveyor for automatic plant-stem imaging. It uses a proximity sensor to detect one stem at a time, stops the conveyor before photography, captures the image with a persistent isolated Arducam/Picamera2 worker, and then restarts the belt.
+This Raspberry Pi application controls a conveyor for barcode-organized plant-stem imaging. It uses a USB barcode scanner to open one batch, a proximity sensor to detect one stem at a time, and a persistent isolated Arducam/Picamera2 worker to save every image under the correct barcode session.
 
-This revision includes two sensor-related fault checks:
+The operator always controls conveyor motion: scanning a barcode creates and
+locks the batch, but **never starts the belt**. This revision also includes two
+sensor-related fault checks:
 
 1. **Stuck-ACTIVE watchdog**: stops the belt if the proximity sensor remains continuously ACTIVE too long.
 2. **No-detection watchdog**: stops the belt if automatic operation runs too long without detecting any stem.
 
 Both faults are fail-closed: the conveyor stops and does not restart automatically.
+
+## Barcode batch workflow
+
+The scanner is used in its normal USB HID keyboard mode. Connect its USB cable
+to the Raspberry Pi; the application receives the characters and the scanner's
+Enter suffix. The scanner's red/black external trigger wires are not used by
+this application. Insulate them separately so they cannot short accidentally.
+
+1. With the belt stopped, scan the batch barcode once.
+2. Confirm that the BATCH field shows the correct value.
+3. Optionally set **EXPECTED** to the total number of samples. Leave it at
+   `Unknown` when the total is not known in advance.
+4. Load samples in the physical groups required by the process (for example,
+   seven at a time), then press **START BELT**.
+5. Use **STOP / PAUSE** whenever more samples must be loaded. The barcode batch
+   and saved count remain active; press **START BELT** to continue.
+6. When all samples for that barcode are finished, stop the belt and press
+   **COMPLETE BATCH**. Confirm the displayed count.
+7. Scan the next barcode and repeat.
+
+The batch locks after the first valid scan. Rapid duplicate scans and all
+later scans—whether the same or a different code—are ignored until the operator
+completes or cancels the current batch. Barcode input never calls the conveyor
+start function. Buttons and the photo list do not take keyboard focus, so the
+scanner's Enter suffix cannot accidentally activate the last touched button.
+
+**CANCEL BATCH** is for an abandoned or incorrect batch. It preserves existing
+images and marks the manifest `cancelled`; it does not delete evidence. A
+completed or cancelled barcode may be reused later because each run receives a
+unique session ID.
+
+## Image storage and recovery
+
+Images are stored under `~/stem_conveyor/images` in this structure:
+
+```text
+stem_conveyor/images/
+└── BARCODE_SAFE_NAME__hash/
+    └── YYYYMMDD_HHMMSS_sessionid/
+        ├── manifest.json
+        ├── sample_0001_auto_timestamp.jpg
+        └── sample_0002_auto_timestamp.jpg
+```
+
+The manifest retains the original barcode, session ID, expected and actual
+counts, image sequence, capture source, timestamps, deletions, and completion
+or cancellation state. The safe folder name includes a hash, preventing path
+characters or similar-looking sanitized barcodes from colliding.
+
+The active batch pointer is written atomically and survives an application or
+Pi restart. On startup, the operator must explicitly choose whether to resume
+the incomplete batch, close it as incomplete, or decide later. The belt remains
+stopped during this decision. If manifest and image files disagree, the system
+locks imaging for developer inspection instead of guessing.
+
+Camera output is first written as a partial file, checked as nonempty, and then
+atomically renamed. The application checks that storage is writable and has at
+least 1 GiB free before creating a batch or image. A camera or storage error
+stops the belt and prevents automatic restart.
+
+**Save Batch to USB** copies the selected session's saved images and manifest,
+preserving the barcode/session folders, and verifies each copy by size and
+SHA-256 checksum. Full-batch export runs in a separate process so the GUI and
+its application watchdog remain responsive. Conveyor motion, barcode changes,
+batch editing, and shutdown are locked until export finishes.
+Removing the USB before the success message is shown can leave an incomplete
+export; the Raspberry Pi copy remains intact.
 
 ## Tested hardware/config values
 
@@ -47,10 +116,12 @@ GPIO HIGH -> relay de-energized -> direction output OFF
 
 Both forward and reverse outputs are commanded OFF before another direction is selected. Proper electrical/mechanical interlocking and an independent physical E-stop are still required; software is not a personnel-safety device.
 
-## Normal automatic workflow
+## Automatic imaging inside an active batch
 
 ```text
-START BELT
+Scan barcode and verify batch
+    ↓
+Press START BELT
     ↓
 Start no-detection timer
     ↓
@@ -147,9 +218,12 @@ The timer is paused/reset while the belt is intentionally stopped for a photo, d
 
 `START BELT` requires:
 
+- an active, confirmed barcode batch;
 - no latched sensor/no-detection fault;
 - the proximity sensor input to be CLEAR;
 - camera worker READY;
+- writable storage with the configured free-space reserve;
+- the expected sample count not already reached;
 - no reset, direction change, or capture cycle already in progress.
 
 If the sensor is already ACTIVE, the belt is not started.
@@ -167,7 +241,7 @@ RESET SYSTEM is fail-closed. It:
 7. checks the proximity sensor;
 8. clears the fault latch when the reset completes and the sensor is physically CLEAR.
 
-A stuck-ACTIVE fault remains latched if the sensor is still ACTIVE after reset. A no-detection fault can clear after RESET when the sensor is CLEAR, but the conveyor still does **not** restart automatically. The operator must press `START BELT` again.
+A stuck-ACTIVE fault remains latched if the sensor is still ACTIVE after reset. A no-detection fault can clear after RESET when the sensor is CLEAR, but the conveyor still does **not** restart automatically. The operator must press `START BELT` again. RESET preserves the active barcode batch and all of its saved images.
 
 ## Persistent camera worker
 
@@ -241,6 +315,7 @@ Conv_controller/
 ├── hardware.py
 ├── camera.py
 ├── camera_worker.py
+├── usb_export_worker.py
 ├── watchdog.py
 ├── storage.py
 ├── runtime_settings.py
@@ -248,6 +323,8 @@ Conv_controller/
 ├── install_kiosk.sh
 ├── KIOSK_SETUP.md
 ├── README.md
+├── tests/
+│   └── test_storage.py
 └── systemd/
     ├── stem-conveyor.service
     ├── stem-conveyor-autostart.desktop

@@ -10,6 +10,7 @@ camera/libcamera call hangs.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -84,6 +85,29 @@ def close_camera(camera):
             pass
 
 
+def partial_capture_path(save_path: Path):
+    """Keep an interrupted JPEG out of the final batch image list."""
+    return save_path.with_name(
+        f".{save_path.stem}.partial{save_path.suffix}"
+    )
+
+
+def commit_capture(temporary_path: Path, save_path: Path):
+    """Flush image data, then atomically expose the final JPEG name."""
+    with temporary_path.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(temporary_path, save_path)
+
+    try:
+        directory_fd = os.open(save_path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def main():
     camera = None
 
@@ -124,19 +148,26 @@ def main():
                 continue
 
             save_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = partial_capture_path(save_path)
             try:
                 save_path.unlink(missing_ok=True)
+                temporary_path.unlink(missing_ok=True)
             except OSError:
                 pass
 
             try:
                 if CAMERA_TYPE == "picamera2":
-                    capture_picamera(camera, save_path)
+                    capture_picamera(camera, temporary_path)
                 else:
-                    capture_usb(camera, save_path)
+                    capture_usb(camera, temporary_path)
 
-                if not save_path.exists() or save_path.stat().st_size == 0:
+                if (
+                    not temporary_path.exists()
+                    or temporary_path.stat().st_size == 0
+                ):
                     raise RuntimeError("Camera returned without creating a valid image.")
+
+                commit_capture(temporary_path, save_path)
 
                 send_event(
                     event="capture",
@@ -148,6 +179,7 @@ def main():
             except Exception as error:
                 try:
                     save_path.unlink(missing_ok=True)
+                    temporary_path.unlink(missing_ok=True)
                 except OSError:
                     pass
 

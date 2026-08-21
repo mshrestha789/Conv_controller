@@ -634,12 +634,21 @@ class KioskStemConveyorGUI(StemConveyorGUI):
     # ========================================================
 
     def shutdown_system(self):
+        if self.usb_export_in_progress:
+            QMessageBox.information(
+                self,
+                "USB Export In Progress",
+                "Wait for the USB success or failure message before shutting down.",
+            )
+            return
+
+        batch_note = self.incomplete_batch_note()
         reply = QMessageBox.question(
             self,
             "Shut Down Imaging Station?",
             "Shut down the entire imaging station?\n\n"
             "The conveyor will be stopped first. Wait until the screen goes "
-            "dark before removing power.",
+            f"dark before removing power.{batch_note}",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -877,12 +886,21 @@ class KioskStemConveyorGUI(StemConveyorGUI):
         )
 
     def exit_to_desktop(self):
+        if self.usb_export_in_progress:
+            QMessageBox.information(
+                self,
+                "USB Export In Progress",
+                "Wait for the USB success or failure message before exiting.",
+            )
+            return
+
+        batch_note = self.incomplete_batch_note()
         reply = QMessageBox.question(
             self,
             "Exit to Desktop?",
             "Exit the imaging application and show the desktop?\n\n"
             "The conveyor will remain OFF. The application will start again "
-            "automatically on the next system startup/login.",
+            f"automatically on the next system startup/login.{batch_note}",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
