@@ -104,6 +104,16 @@ CAMERA_KILL_GRACE_MS = 1000
 CAMERA_RESET_RESTART_DELAY_MS = 750
 PICAMERA_STILL_SIZE = (4624, 3472)
 
+# Autofocus is performed for every stopped sample before choosing a full frame.
+# Normalized x, y, width, height in the full sensor view: focus/score only,
+# NEVER a crop of the saved image. Recalibrate if the camera/holder moves.
+CAMERA_FOCUS_ROI = (0.43, 0.56, 0.16, 0.09)
+CAMERA_FOCUS_CANDIDATES = 3
+# Relative sharpness is not a universal quality guarantee. None disables the
+# absolute gate until calibrated with known good/bad images on this station.
+CAMERA_MIN_SHARPNESS = None
+CAMERA_JPEG_QUALITY = 95
+
 USB_CAMERA_INDEX = 0
 USB_CAMERA_WARMUP_SEC = 0.2
 

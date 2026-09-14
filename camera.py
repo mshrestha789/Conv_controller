@@ -192,9 +192,12 @@ class Camera(QObject):
             message = event.get("message") or ""
 
             if success:
+                if event.get("quality"):
+                    print("Camera focus selection: " + json.dumps(event["quality"]), flush=True)
                 self.capture_completed.emit(True, str(save_path), message)
             else:
                 self._remove_partial_file(save_path)
+                self._set_fault(message or "Camera focus/capture failed. Reset required.")
                 self.capture_completed.emit(False, str(save_path), message)
 
     # ========================================================
@@ -216,6 +219,7 @@ class Camera(QObject):
             {
                 "cmd": "capture",
                 "path": str(self.save_path),
+                "timeout_sec": CAMERA_CAPTURE_TIMEOUT_SEC,
             }
         ) + "\n"
 
