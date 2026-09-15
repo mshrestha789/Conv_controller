@@ -34,7 +34,7 @@ def init_picamera():
     if not Picamera2.global_camera_info():
         raise RuntimeError("No CSI camera detected.")
 
-    from libcamera import Rectangle, controls
+    from libcamera import controls
 
     validate_settings(CAMERA_FOCUS_ROI, CAMERA_FOCUS_CANDIDATES, CAMERA_MIN_SHARPNESS)
     picam2 = Picamera2()
@@ -54,7 +54,8 @@ def init_picamera():
             "AfMode": controls.AfModeEnum.Auto,
             "AfRange": controls.AfRangeEnum.Full,
             "AfMetering": controls.AfMeteringEnum.Windows,
-            "AfWindows": [Rectangle(*window)],
+            # Picamera2 converts coordinate tuples into libcamera Rectangles.
+            "AfWindows": [window],
         })
         picam2.options["quality"] = CAMERA_JPEG_QUALITY
         picam2.start()
@@ -244,4 +245,3 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
