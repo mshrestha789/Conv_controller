@@ -209,7 +209,7 @@ class TouchValueControl(QWidget):
         spin_box.installEventFilter(self)
         self.setFocusProxy(spin_box)
 
-        self.decrease_button = self._step_button("âˆ’", f"Decrease {label}")
+        self.decrease_button = self._step_button("-", f"Decrease {label}")
         self.increase_button = self._step_button("+", f"Increase {label}")
         self.decrease_button.clicked.connect(spin_box.stepDown)
         self.increase_button.clicked.connect(spin_box.stepUp)
@@ -342,7 +342,7 @@ class ConfigurationDialog(QDialog):
         info.setStyleSheet("padding: 8px; color: #52637a;")
         content_layout.addWidget(info)
 
-        touch_hint = QLabel("Tap âˆ’ / +, or hold to repeat. Swipe to scroll.")
+        touch_hint = QLabel("Tap - / +, or hold to repeat. Swipe to scroll.")
         touch_hint.setWordWrap(True)
         touch_hint.setStyleSheet("font-size: 16px; color: #52637a; padding: 4px;")
         content_layout.addWidget(touch_hint)
