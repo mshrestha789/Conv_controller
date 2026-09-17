@@ -12,6 +12,7 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QComboBox,
     QDialog,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QScroller,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -189,6 +191,78 @@ class PinEntryDialog(QDialog):
         return self.pin_edit.text()
 
 
+class TouchValueControl(QWidget):
+    """Large separate step buttons around an existing bounded spin box."""
+
+    def __init__(self, spin_box, label, parent=None):
+        super().__init__(parent)
+        self.spin_box = spin_box
+        spin_box.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        spin_box.setAlignment(Qt.AlignCenter)
+        spin_box.setMinimumSize(140, 56)
+        spin_box.setAccessibleName(label)
+        spin_box.setStyleSheet(
+            "font-size: 20px; font-weight: 700; padding: 6px; "
+            "background: white; color: #22304a; "
+            "border: 1px solid #bac6da; border-radius: 8px;"
+        )
+        spin_box.installEventFilter(self)
+        self.setFocusProxy(spin_box)
+
+        self.decrease_button = self._step_button("âˆ’", f"Decrease {label}")
+        self.increase_button = self._step_button("+", f"Increase {label}")
+        self.decrease_button.clicked.connect(spin_box.stepDown)
+        self.increase_button.clicked.connect(spin_box.stepUp)
+        spin_box.valueChanged.connect(self._update_button_state)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        row.addWidget(self.decrease_button)
+        row.addWidget(spin_box, 1)
+        row.addWidget(self.increase_button)
+        self._update_button_state()
+
+    @staticmethod
+    def _step_button(text, label):
+        button = QPushButton(text)
+        button.setFixedSize(64, 56)
+        button.setAutoDefault(False)
+        button.setAutoRepeat(True)
+        button.setAutoRepeatDelay(500)
+        button.setAutoRepeatInterval(150)
+        button.setAccessibleName(label)
+        button.setToolTip(label + " (hold to repeat)")
+        button.setStyleSheet("""
+            QPushButton {
+                background: #e5edff; color: #244ab0;
+                border: 1px solid #aabde9; border-radius: 8px;
+                font-size: 30px; font-weight: 700; padding: 0;
+            }
+            QPushButton:pressed { background: #c6d7ff; padding: 0; }
+            QPushButton:focus { border: 2px solid #244ab0; }
+            QPushButton:disabled {
+                background: #edf0f5; color: #9ba5b5; border-color: #d9dfe9;
+            }
+        """)
+        return button
+
+    def _update_button_state(self, _value=None):
+        self.decrease_button.setEnabled(
+            self.spin_box.value() > self.spin_box.minimum()
+        )
+        self.increase_button.setEnabled(
+            self.spin_box.value() < self.spin_box.maximum()
+        )
+
+    def eventFilter(self, watched, event):
+        if watched is self.spin_box and event.type() == QEvent.Wheel:
+            # Scrolling the settings page must not silently edit a value.
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
+
+
 class ConfigurationDialog(QDialog):
     """Protected operational calibration page.
 
@@ -210,8 +284,8 @@ class ConfigurationDialog(QDialog):
         screen = self.screen() or QApplication.primaryScreen()
         if screen is not None:
             available = screen.availableGeometry()
-            dialog_width = min(760, max(1, available.width() - 40))
-            dialog_height = min(620, max(1, available.height() - 70))
+            dialog_width = min(920, max(1, available.width() - 40))
+            dialog_height = min(850, max(1, available.height() - 70))
             self.resize(dialog_width, dialog_height)
             self.setMinimumSize(
                 min(520, dialog_width),
@@ -230,6 +304,22 @@ class ConfigurationDialog(QDialog):
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QFrame.NoFrame)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.verticalScrollBar().setStyleSheet("""
+            QScrollBar:vertical {
+                width: 32px; background: #e8edf6; border: none; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #a5b6cf; min-height: 56px;
+                border-radius: 8px; margin: 4px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+                background: none;
+            }
+        """)
+        QScroller.grabGesture(scroll_area.viewport(), QScroller.TouchGesture)
 
         content = QWidget(scroll_area)
         content_layout = QVBoxLayout(content)
@@ -240,6 +330,7 @@ class ConfigurationDialog(QDialog):
 
         title = QLabel("DEVELOPER CONFIGURATION")
         title.setAlignment(Qt.AlignCenter)
+        title.setWordWrap(True)
         title.setStyleSheet("font-size: 22px; font-weight: 800;")
         content_layout.addWidget(title)
 
@@ -251,20 +342,49 @@ class ConfigurationDialog(QDialog):
         info.setStyleSheet("padding: 8px; color: #52637a;")
         content_layout.addWidget(info)
 
+        touch_hint = QLabel("Tap âˆ’ / +, or hold to repeat. Swipe to scroll.")
+        touch_hint.setWordWrap(True)
+        touch_hint.setStyleSheet("font-size: 16px; color: #52637a; padding: 4px;")
+        content_layout.addWidget(touch_hint)
+
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(12)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+        def add_setting(label, box):
+            label_widget = QLabel(label)
+            label_widget.setMinimumHeight(56)
+            label_widget.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            label_widget.setStyleSheet("font-size: 16px;")
+            label_widget.setBuddy(box)
+            form.addRow(label_widget, TouchValueControl(box, label))
 
         self.sensor_polarity = QComboBox()
+        self.sensor_polarity.setMinimumHeight(56)
+        self.sensor_polarity.setStyleSheet("""
+            QComboBox { font-size: 18px; padding: 6px 12px; }
+            QComboBox::drop-down { width: 48px; }
+            QComboBox QAbstractItemView { font-size: 18px; }
+            QComboBox QAbstractItemView::item { min-height: 48px; }
+        """)
         self.sensor_polarity.addItem("Active LOW", False)
         self.sensor_polarity.addItem("Active HIGH", True)
         index = self.sensor_polarity.findData(values["sensor_active_high"])
         self.sensor_polarity.setCurrentIndex(max(index, 0))
-        form.addRow("Sensor detected state", self.sensor_polarity)
+        polarity_label = QLabel("Sensor detected state")
+        polarity_label.setMinimumHeight(56)
+        polarity_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        polarity_label.setStyleSheet("font-size: 16px;")
+        polarity_label.setBuddy(self.sensor_polarity)
+        form.addRow(polarity_label, self.sensor_polarity)
 
         self.sensor_bounce = self._double_box(
             values["sensor_bounce_time_sec"], 0.0, 1.0, 0.01, 2, " s"
         )
-        form.addRow("Sensor debounce", self.sensor_bounce)
+        add_setting("Sensor debounce", self.sensor_bounce)
 
         self.stuck_timeout = self._double_box(
             values["sensor_stuck_active_timeout_sec"],
@@ -274,7 +394,7 @@ class ConfigurationDialog(QDialog):
             1,
             " s",
         )
-        form.addRow("Sensor stuck-active timeout", self.stuck_timeout)
+        add_setting("Sensor stuck-active timeout", self.stuck_timeout)
 
         self.no_detection_timeout = self._double_box(
             values["no_detection_timeout_sec"],
@@ -284,22 +404,22 @@ class ConfigurationDialog(QDialog):
             1,
             " s",
         )
-        form.addRow("No-detection timeout", self.no_detection_timeout)
+        add_setting("No-detection timeout", self.no_detection_timeout)
 
         self.sensor_to_stop = self._double_box(
             values["sensor_to_stop_delay_sec"], 0.05, 10.0, 0.05, 2, " s"
         )
-        form.addRow("Sensor -> stop delay", self.sensor_to_stop)
+        add_setting("Sensor -> stop delay", self.sensor_to_stop)
 
         self.belt_settle = self._double_box(
             values["belt_settle_delay_sec"], 0.0, 5.0, 0.05, 2, " s"
         )
-        form.addRow("Belt settle delay", self.belt_settle)
+        add_setting("Belt settle delay", self.belt_settle)
 
         self.post_capture = self._double_box(
             values["post_capture_delay_sec"], 0.0, 5.0, 0.05, 2, " s"
         )
-        form.addRow("Post-photo restart delay", self.post_capture)
+        add_setting("Post-photo restart delay", self.post_capture)
 
         self.batch_completion_runout = self._double_box(
             values["batch_completion_runout_delay_sec"],
@@ -313,7 +433,7 @@ class ConfigurationDialog(QDialog):
             "After the final expected photo, run the belt this long to move "
             "the last sample clear. Set 0 for an immediate stop."
         )
-        form.addRow(
+        add_setting(
             "Final-sample belt runout",
             self.batch_completion_runout,
         )
@@ -325,7 +445,7 @@ class ConfigurationDialog(QDialog):
         self.direction_dead_time.setValue(
             values["direction_change_dead_time_ms"]
         )
-        form.addRow("Direction-change dead time", self.direction_dead_time)
+        add_setting("Direction-change dead time", self.direction_dead_time)
 
         self.camera_timeout = self._double_box(
             values["camera_capture_timeout_sec"],
@@ -335,7 +455,7 @@ class ConfigurationDialog(QDialog):
             1,
             " s",
         )
-        form.addRow("Camera capture timeout", self.camera_timeout)
+        add_setting("Camera capture timeout", self.camera_timeout)
 
         content_layout.addLayout(form)
 
@@ -353,6 +473,7 @@ class ConfigurationDialog(QDialog):
 
         self.sensor_test = QLabel("Sensor input: checking...")
         self.sensor_test.setAlignment(Qt.AlignCenter)
+        self.sensor_test.setWordWrap(True)
         self.sensor_test.setStyleSheet(
             "font-size: 16px; font-weight: 700; padding: 8px;"
         )
@@ -361,6 +482,7 @@ class ConfigurationDialog(QDialog):
         # Keep every action outside the scrolling region so the operator can
         # always save, cancel, or restore defaults without hidden controls.
         action_row = QHBoxLayout()
+        action_row.setSpacing(12)
         restore_button = QPushButton("Restore Defaults")
         restore_button.clicked.connect(self._restore_defaults)
         action_row.addWidget(restore_button)
@@ -368,6 +490,19 @@ class ConfigurationDialog(QDialog):
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Save | QDialogButtonBox.Cancel
+        )
+        for button in (restore_button, *buttons.buttons()):
+            button.setMinimumHeight(56)
+            button.setAutoDefault(False)
+            button.setStyleSheet(
+                "font-size: 16px; font-weight: 700; padding: 8px 12px; "
+                "background: #e8edf6; color: #2e3b55; "
+                "border: 1px solid #bdc9db; border-radius: 8px;"
+            )
+        buttons.button(QDialogButtonBox.Save).setStyleSheet(
+            "font-size: 16px; font-weight: 700; padding: 8px 20px; "
+            "background: #3459cb; color: white; "
+            "border: 1px solid #244ab0; border-radius: 8px;"
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
